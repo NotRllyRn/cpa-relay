@@ -23,11 +23,10 @@ addresses={'exporter':str(network[2]),'receiver':str(network[3])}
 run('openssl','req','-x509','-newkey','rsa:2048','-nodes','-keyout',str(root/'key.pem'),'-out',str(root/'cert.pem'),'-days','1','-subj','/CN='+name+'-exporter','-addext','subjectAltName=DNS:'+name+'-exporter,IP:'+addresses['exporter'])
 for role in ('exporter','receiver'):
  for asset in ('cert.pem','key.pem'):(root/role/asset).write_bytes((root/asset).read_bytes())
- cfg={'config-version':8,'server':{'host':'0.0.0.0','port':8317,'commercial-mode':True},'management':{'allow-remote':True,'secret-key':admin,'disable-control-panel':True},'access':{'api-keys':[api]},'oauth':{'auth-dir':'/fixture/auth'},'observability':{'logs':{'request-log':False}},'plugins':{'enabled':True,'dir':'/fixture/plugins','configs':{'cpa-relay':{'enabled':True,'priority':100,'role':role,'secret_env':'CPA_RELAY_BEARER','accounts':['acct-test'],'state_dir':'/fixture/state'}}}}
+ cfg={'config-version':8,'server':{'host':'0.0.0.0','port':8317,'commercial-mode':True},'management':{'allow-remote':True,'secret-key':admin,'disable-control-panel':True},'access':{'api-keys':[api]},'oauth':{'auth-dir':'/fixture/auth'},'observability':{'logs':{'request-log':False}},'plugins':{'enabled':True,'dir':'/fixture/plugins','configs':{'cpa-relay':{'enabled':True,'priority':100,'role':role,'secret_env':'CPA_RELAY_BEARER','state_dir':'/fixture/state'}}}}
  if role=='exporter':
   cfg['server']['tls']={'enable':True,'cert':'/fixture/cert.pem','key':'/fixture/key.pem'}
-  cfg['plugins']['configs']['cpa-relay']['source_files']=['source.json']
- else:cfg['plugins']['configs']['cpa-relay'].update({'auth_dir':'/fixture/auth','receiver_id':'test','endpoint':'https://'+name+'-exporter:8317/v0/resource/plugins/cpa-relay/snapshot','poll_seconds':1,'max_stale_seconds':30,'expiry_skew_seconds':5})
+ else:cfg['plugins']['configs']['cpa-relay'].update({'enabled':False,'auth_dir':'/fixture/auth','receiver_id':'test','endpoint':'https://'+name+'-exporter:8317/v0/resource/plugins/cpa-relay/snapshot','poll_seconds':1,'max_stale_seconds':30,'expiry_skew_seconds':5})
  (root/role/'config.json').write_text(json.dumps(cfg))
 def credential(generation):
  exp=int(time.time())+3600
@@ -35,7 +34,13 @@ def credential(generation):
  return {'type':'codex','access_token':'e30.'+payload+'.fake','account_id':'acct-test','email':'test@example.invalid','expired':datetime.datetime.fromtimestamp(exp,datetime.timezone.utc).isoformat(),'last_refresh':datetime.datetime.now(datetime.timezone.utc).isoformat(),'refresh_token':'REFRESH_CANARY_NEVER_EXPORT','id_token':'ID_CANARY_NEVER_EXPORT','disabled':False}
 source=root/'exporter/auth/source.json';source.write_text(json.dumps(credential(1)))
 other=credential(900);other['email']='other@example.invalid'
-(root/'exporter/auth/other.json').write_text(json.dumps(other))
+other_source=root/'exporter/auth/other.json';other_source.write_text(json.dumps(other))
+def receiver_files():return list((root/'receiver/auth').glob('cpa-relay-*.json'))
+def snapshot_count(count):
+ code,snap=call('exporter','/v0/resource/plugins/cpa-relay/snapshot',secret)
+ return code==200 and len(snap['accounts'])==count
+def atomic_source(path,data):
+ tmp=path.with_suffix('.tmp');tmp.write_text(json.dumps(data));tmp.replace(path)
 context=ssl.create_default_context(cafile=str(root/'cert.pem'))
 def call(role,path,key=None,method='GET',body=None):
  url=('https' if role=='exporter' else 'http')+'://'+addresses[role]+':8317'+path
@@ -78,26 +83,50 @@ try:
   run('docker','run','-d','--name',name+'-'+role,'--network',name,'--env-file',str(root/'env'),'-v',str(root/role)+':/fixture',image,'./CLIProxyAPI','-config','/fixture/config.json')
   actual=json.loads(run('docker','inspect',name+'-'+role))[0]['NetworkSettings']['Networks'][name]['IPAddress']
   assert actual==addresses[role], 'unexpected fixture IP allocation'
+ # Let stock CPA finish its initial directory scan before materializing new
+ # records; otherwise its initial load can race the callback model registration.
+ wait(lambda:call('receiver','/v0/management/plugins',admin)[0]==200,'stock receiver management started')
+ time.sleep(2)
+ assert call('receiver','/v0/management/plugins/cpa-relay/enabled',admin,method='PATCH',body={'enabled':True})[0]==200
  wait(lambda:call('receiver','/v0/resource/plugins/cpa-relay/ready')[0]==200,'actual CPA receiver ready after background save and model confirmation')
  assert_ready_models()
  code,snap=call('exporter','/v0/resource/plugins/cpa-relay/snapshot',secret)
  assert code==200 and 'REFRESH_CANARY' not in json.dumps(snap) and 'ID_CANARY' not in json.dumps(snap)
- assert len(snap['accounts'])==1 and snap['accounts'][0]['email']=='test@example.invalid'
- assert all(value not in json.dumps(snap) for value in ('source.json','other.json','other@example.invalid','/fixture/auth/'))
- print('PASS: exact physical filename selects one of two logins sharing a workspace without relaying filenames')
+ assert snap['version']==2 and len(snap['accounts'])==2
+ assert len({a['credential_id'] for a in snap['accounts']})==2
+ assert len({a['account_id'] for a in snap['accounts']})==1
+ assert all(value not in json.dumps(snap) for value in ('source.json','other.json','/fixture/auth/'))
+ print('PASS: automatic discovery preserves two physical logins sharing a workspace without relaying filenames')
  assert call('exporter','/v0/resource/plugins/cpa-relay/snapshot')[0]==401
  print('PASS: exporter authentication and projection')
- files=list((root/'receiver/auth').glob('cpa-relay-*.json'));assert len(files)==1
- assert 'refresh_token' not in json.loads(files[0].read_text())
- code,listing=call('receiver','/v0/management/auth-files',admin);assert code==200
- assert any(f.get('name')==files[0].name and not f.get('disabled') for f in listing['files'])
- original=source.read_bytes();source.unlink()
- wait(lambda:call('exporter','/v0/resource/plugins/cpa-relay/snapshot',secret)[0]==503,'missing selected source rejects export without falling back to same-workspace login')
- assert files[0].exists(), 'failed export removed fresh receiver credential'
+ files=receiver_files();assert len(files)==2
+ assert all('refresh_token' not in json.loads(f.read_text()) for f in files)
+ by_email={json.loads(f.read_text())['email']:f for f in files}
+ primary=by_email['test@example.invalid'];secondary=by_email['other@example.invalid']
+ unchanged={f:f.stat().st_mtime_ns for f in files};time.sleep(3)
+ assert all(f.stat().st_mtime_ns==mtime for f,mtime in unchanged.items()), 'unchanged sync rewrote credential'
+ print('PASS: repeated unchanged full snapshots do not rewrite credential files')
+ original=source.read_bytes();source.write_text('{}')
+ wait(lambda:call('exporter','/v0/resource/plugins/cpa-relay/snapshot',secret)[0]==503,'malformed physical read rejects entire export')
+ cached=json.loads((root/'receiver/state/state.json').read_text())['snapshot']['generated_at']
+ time.sleep(3)
+ assert all(f.exists() for f in files), 'failed export deleted fresh receiver credentials'
+ assert json.loads((root/'receiver/state/state.json').read_text())['snapshot']['generated_at']==cached, 'failed fetch extended generation'
  source.write_bytes(original)
- wait(lambda:call('exporter','/v0/resource/plugins/cpa-relay/snapshot',secret)[0]==200,'selected source restored')
- updated=credential(2);tmp=source.with_suffix('.tmp');tmp.write_text(json.dumps(updated));tmp.replace(source)
- wait(lambda:json.loads(files[0].read_text())['access_token']==updated['access_token'],'new access token replaced in same file')
+ wait(lambda:snapshot_count(2),'valid source restored')
+ updated=credential(2);atomic_source(source,updated)
+ wait(lambda:json.loads(primary.read_text())['access_token']==updated['access_token'],'new access token replaced correct same-workspace file')
+ assert secondary.stat().st_mtime_ns==unchanged[secondary], 'refresh rewrote another same-workspace login'
+ third=source.with_name('new.json');third_data=credential(500);third_data['email']='new@example.invalid';atomic_source(third,third_data)
+ wait(lambda:len(receiver_files())==3,'new same-workspace credential discovered on next sync')
+ other_source.unlink()
+ wait(lambda:len(receiver_files())==2 and not secondary.exists(),'source deletion removes only its relay record')
+ source.unlink();third.unlink()
+ wait(lambda:snapshot_count(0) and not receiver_files() and call('receiver','/v0/resource/plugins/cpa-relay/ready')[0]==503,'valid empty inventory disables and deletes all owned records')
+ assert json.loads((root/'receiver/state/state.json').read_text())['managed']==[]
+ atomic_source(source,updated)
+ wait(lambda:len(receiver_files())==1 and primary.exists(),'new discovery after delete-all')
+ files=[primary]
  wait(lambda:call('receiver','/v0/resource/plugins/cpa-relay/ready')[0]==200,'updated credential ready with registered models')
  assert_ready_models()
  assert call('receiver','/v0/management/cpa-relay/drain',method='POST')[0]==401
@@ -113,7 +142,7 @@ try:
  wait(lambda:call('receiver','/v0/resource/plugins/cpa-relay/ready')[0]==200,'stock CPA re-enable requires newer live snapshot')
  assert_ready_models()
  disabled=credential(3);disabled['disabled']=True;source.write_text(json.dumps(disabled))
- wait(lambda:call('receiver','/v0/resource/plugins/cpa-relay/ready')[0]==503 and not files[0].exists(),'authoritative selected-source disable closes readiness and removes managed file')
+ wait(lambda:call('receiver','/v0/resource/plugins/cpa-relay/ready')[0]==503 and not files[0].exists(),'authoritative disabled-source omission closes readiness and removes managed file')
  wait(lambda:not any(f.get('name')==files[0].name for f in call('receiver','/v0/management/auth-files',admin)[1]['files']),'removed credential absent from actual CPA runtime')
  # Negative case: stock disable closes callback context before native shutdown.
  # Do NOT infer acknowledged withdrawal from an eventual watcher update.
@@ -125,14 +154,18 @@ try:
  assert json.loads((root/'receiver/state/state.json').read_text())['managed'], 'abrupt disable unexpectedly acknowledged cleanup'
  assert files[0].exists(), 'abrupt disable incorrectly reported physical cleanup'
  print('PASS: stock abrupt disable retains unacknowledged cleanup; no plugin-only shutdown guarantee')
- # Cold-start with only the alias so a live remove/create cannot coalesce away
- # the misleading metadata. Receiver lifecycle/model tests are complete above.
+ # Leading basename whitespace is a distinct, valid physical identity. Stock
+ # trims Name, not the raw middle-of-path space. No filename pin exists now.
  source.unlink()
  alias=source.with_name(' source.json');alias_data=credential(901);alias_data['email']='alias@example.invalid';alias.write_text(json.dumps(alias_data))
  run('docker','restart',name+'-exporter')
- wait(lambda:any(f.get('path')=='/fixture/auth/ source.json' and f.get('name')=='source.json' for f in call('exporter','/v0/management/auth-files',admin)[1]['files']),'stock host observes leading-space physical alias under trimmed selected Name')
- assert call('exporter','/v0/resource/plugins/cpa-relay/snapshot',secret)[0]==503, 'trimmed source Name exported a different physical login'
- print('PASS: missing pinned physical file rejects trimmed-Name alias instead of exporting another login')
+ wait(lambda:any(f.get('path')=='/fixture/auth/ source.json' and f.get('name')=='source.json' for f in call('exporter','/v0/management/auth-files',admin)[1]['files']),'stock host observes leading-space physical identity under trimmed Name')
+ code,renamed=call('exporter','/v0/resource/plugins/cpa-relay/snapshot',secret)
+ assert code==200 and len(renamed['accounts'])==1
+ original_id=next(a['credential_id'] for a in snap['accounts'] if a['email']=='test@example.invalid')
+ assert renamed['accounts'][0]['credential_id']!=original_id
+ assert '/fixture/auth/' not in json.dumps(renamed) and 'source.json' not in json.dumps(renamed)
+ print('PASS: physical rename is opaque delete-and-add, not a trimmed-name identity alias')
  for role in ('exporter','receiver'):
   logs=run('docker','logs',name+'-'+role)
   assert 'REFRESH_CANARY' not in logs and 'ID_CANARY' not in logs
@@ -141,6 +174,8 @@ try:
 except Exception:
  # Only coarse diagnostics: never print tokens, account IDs, config or bodies.
  try:
+  _,sources=call('exporter','/v0/management/auth-files',admin)
+  print('Source diagnostics:',[{k:entry.get(k) for k in ('type','provider','runtime_only','disabled')} for entry in sources.get('files',[])],flush=True)
   code,status=call('receiver','/v0/management/cpa-relay/status',admin)
   print('Receiver diagnostic:',code,{k:status.get(k) for k in ('ready','state','last_attempt')},flush=True)
   _,listing=call('receiver','/v0/management/auth-files',admin)

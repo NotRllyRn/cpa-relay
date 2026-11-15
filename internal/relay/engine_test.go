@@ -21,19 +21,26 @@ type fakeSource struct {
 }
 
 func (s fakeSource) List() ([]Entry, error) { return s.entries, s.err }
-func (s fakeSource) Get(index string) ([]byte, error) {
-	b, ok := s.raw[index]
+func (s fakeSource) Removed(path string) (bool, error) {
+	for _, entry := range s.entries {
+		if entry.Path == path {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+func (s fakeSource) Get(entry Entry) ([]byte, error) {
+	b, ok := s.raw[entry.Index]
 	if !ok {
 		return nil, errors.New("secret-source-error")
 	}
 	return b, nil
 }
-func TestExporterReadOnlySelectionAuthAndPersistence(t *testing.T) {
+func TestExporterReadOnlyDiscoveryAuthAndPersistence(t *testing.T) {
 	now := time.Now().UTC()
 	c := diskConfig(t, "exporter")
-	c.Accounts = []string{"acct-a"}
 	raw := strings.TrimSuffix(string(marshal(t, account(now, "acct-a"))), "}") + `,"refresh_token":"do-not-export","id_token":"do-not-export","metadata":{"secret":"do-not-export"}}`
-	src := fakeSource{entries: []Entry{{Index: "a", Codex: true}, {Index: "b", Codex: true}, {Index: "other"}}, raw: map[string][]byte{"a": []byte(raw), "b": marshal(t, account(now, "acct-b"))}}
+	src := fakeSource{entries: []Entry{{Index: "a", Name: "a.json", Path: "/auth/a.json", Codex: true}, {Index: "b", Name: "b.json", Path: "/auth/b.json", Codex: true}, {Index: "other"}}, raw: map[string][]byte{"a": []byte(raw), "b": marshal(t, account(now, "acct-b"))}}
 	e, err := New(c, secret(), src)
 	if err != nil {
 		t.Fatal(err)
@@ -45,8 +52,8 @@ func TestExporterReadOnlySelectionAuthAndPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(b), "do-not-export") || strings.Contains(string(b), "acct-b") {
-		t.Fatal("selection/sanitization leak")
+	if strings.Contains(string(b), "do-not-export") || !strings.Contains(string(b), "acct-b") {
+		t.Fatal("discovery/sanitization mismatch")
 	}
 	if _, err = e.Export(now); err == nil {
 		t.Fatal("clock replay exported")
@@ -136,8 +143,8 @@ func TestReceiverFullSnapshotsFailureReplayRemovalExpiryAndRestart(t *testing.T)
 	if e.Gate() {
 		t.Fatal("gate closed")
 	}
-	nameA := e.store.filename("acct-a")
-	nameB := e.store.filename("acct-b")
+	nameA := e.store.filename(credentialID("acct-a"))
+	nameB := e.store.filename(credentialID("acct-b"))
 	f.reply.Store(&httpReply{status: 500, content: "application/json", body: []byte("private response")})
 	n := f.calls.Load()
 	e.Trigger()
@@ -267,7 +274,7 @@ func TestWriteErrorNeverReadyAndShutdownCleans(t *testing.T) {
 	c.Endpoint = f.server.URL + SnapshotPath
 	// Reserve a colliding file; the receiver must refuse ownership, not delete it.
 	probe := &store{cfg: c}
-	path := filepath.Join(c.AuthDir, probe.filename("acct-a"))
+	path := filepath.Join(c.AuthDir, probe.filename(credentialID("acct-a")))
 	os.WriteFile(path, []byte("manual"), 0600)
 	f.set(t, snapshot(time.Now(), "acct-a"))
 	e, err := newEngine(c, secret(), diskHost(c.AuthDir), f.transport())

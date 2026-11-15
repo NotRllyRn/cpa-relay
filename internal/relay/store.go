@@ -18,11 +18,12 @@ import (
 var ErrStorage = errors.New("relay storage unavailable")
 
 type diskState struct {
-	Version   int       `json:"version"`
-	Binding   string    `json:"binding"`
-	Watermark int64     `json:"watermark"`
-	Snapshot  *Snapshot `json:"snapshot,omitempty"`
-	Managed   []string  `json:"managed"`
+	Version     int       `json:"version"`
+	Binding     string    `json:"binding"`
+	Watermark   int64     `json:"watermark"`
+	Snapshot    *Snapshot `json:"snapshot,omitempty"`
+	Managed     []string  `json:"managed"`
+	SourcePaths []string  `json:"source_paths,omitempty"` // exporter-only, private; never sent on wire
 }
 
 type store struct {
@@ -101,20 +102,34 @@ func openStore(c Config) (_ *store, err error) {
 	if err != nil {
 		return nil, ErrStorage
 	}
-	s.state = diskState{Version: 1, Binding: c.binding(), Managed: []string{}}
+	s.state = diskState{Version: 2, Binding: c.binding(), Managed: []string{}}
 	raw, e := readPrivate(s.root, "state.json")
 	if e == nil {
-		if strictJSON(raw, &s.state) != nil || s.state.Version != 1 || s.state.Binding != c.binding() || s.state.Watermark < 0 || len(s.state.Managed) > MaxAccounts*2 {
+		if strictJSON(raw, &s.state) != nil || s.state.Version != 2 || s.state.Binding != c.binding() || s.state.Watermark < 0 || len(s.state.Managed) > MaxAccounts*2 {
 			return nil, ErrStorage
+		}
+		if len(s.state.SourcePaths) > MaxAccounts || (c.Role != "exporter" && len(s.state.SourcePaths) != 0) {
+			return nil, ErrStorage
+		}
+		paths := map[string]bool{}
+		for _, path := range s.state.SourcePaths {
+			if !sourcePathValid(path) || paths[path] {
+				return nil, ErrStorage
+			}
+			paths[path] = true
 		}
 		seen := map[string]bool{}
 		for _, id := range s.state.Managed {
-			if !idPattern.MatchString(id) || seen[id] {
+			if !credentialPattern.MatchString(id) || seen[id] {
 				return nil, ErrStorage
 			}
 			seen[id] = true
 		}
-		if s.state.Snapshot != nil && (s.state.Snapshot.Generation != s.state.Watermark || s.state.Snapshot.Generation <= 0) {
+		// Check the stored schema at its own generation, without applying a newly
+		// increased skew. Cache validity never authorizes startup admission.
+		cacheConfig := c
+		cacheConfig.ExpirySkewSeconds = 0
+		if s.state.Snapshot != nil && (s.state.Snapshot.Generation != s.state.Watermark || Validate(*s.state.Snapshot, cacheConfig, s.state.Snapshot.GeneratedAt) != nil) {
 			return nil, ErrStorage
 		}
 	} else if !os.IsNotExist(e) {
@@ -219,19 +234,19 @@ func (s *store) accept(snap Snapshot) error {
 	}
 	for _, a := range snap.Accounts {
 		// Never claim or overwrite a pre-existing file outside our durable inventory.
-		if !ids[a.AccountID] {
-			if _, err := s.auth.Lstat(s.filename(a.AccountID)); !os.IsNotExist(err) {
+		if !ids[a.CredentialID] {
+			if _, err := s.auth.Lstat(s.filename(a.CredentialID)); !os.IsNotExist(err) {
 				return ErrStorage
 			}
 		}
-		ids[a.AccountID] = true
+		ids[a.CredentialID] = true
 	}
 	managed := make([]string, 0, len(ids))
 	for id := range ids {
 		managed = append(managed, id)
 	}
 	sort.Strings(managed)
-	st := diskState{Version: 1, Binding: s.cfg.binding(), Watermark: snap.Generation, Snapshot: &snap, Managed: managed}
+	st := diskState{Version: 2, Binding: s.cfg.binding(), Watermark: snap.Generation, Snapshot: &snap, Managed: managed}
 	return s.save(st)
 }
 
@@ -261,21 +276,21 @@ func (s *store) clean(id string) error {
 		return ErrStorage
 	}
 	var a Account
-	if strictJSON(raw, &a) != nil || a.AccountID != id || a.Type != "codex" {
+	if strictJSON(raw, &a) != nil || a.CredentialID != id || a.Type != "codex" {
 		return ErrStorage
 	}
 	return nil
 }
 
 func tombstone(id string) Account {
-	return Account{Type: "codex", AccountID: id, Expired: "1970-01-01T00:00:00Z", Disabled: true}
+	return Account{Type: "codex", CredentialID: id, Expired: "1970-01-01T00:00:00Z", Disabled: true}
 }
 
 // Host save is not a transaction: first atomically stage the sanitized file,
 // then require synchronous runtime acknowledgement, then verify persisted data.
 // The request gate stays closed across the entire reconciliation.
 func (s *store) saveCredential(a Account, sink Sink) error {
-	name := s.filename(a.AccountID)
+	name := s.filename(a.CredentialID)
 	raw, err := json.Marshal(a)
 	if err != nil || atomicWrite(s.auth, name, raw) != nil {
 		return ErrStorage
@@ -323,7 +338,7 @@ func (s *store) withdrawRuntime(sink Sink) error {
 		return ErrStorage
 	}
 	// All old records are synchronously disabled and physically absent. Keep the
-	// snapshot/watermark, but retire the inventory so selectors can evolve safely.
+	// snapshot/watermark, but retire the acknowledged ownership inventory.
 	if len(s.state.Managed) > 0 {
 		st := s.state
 		st.Managed = []string{}
@@ -341,7 +356,7 @@ func (s *store) reconcile(snap Snapshot, sink Sink) (err error) {
 	wanted := map[string]Account{}
 	for _, a := range snap.Accounts {
 		if !a.Disabled {
-			wanted[a.AccountID] = a
+			wanted[a.CredentialID] = a
 		}
 	}
 	unchanged := map[string]bool{}
@@ -378,11 +393,11 @@ func (s *store) reconcile(snap Snapshot, sink Sink) (err error) {
 		}
 	}
 	for _, a := range snap.Accounts {
-		if a.Disabled || unchanged[a.AccountID] {
+		if a.Disabled || unchanged[a.CredentialID] {
 			continue
 		}
 		// Check again after tombstone callbacks: another writer may have interfered.
-		if s.clean(a.AccountID) != nil {
+		if s.clean(a.CredentialID) != nil {
 			return ErrStorage
 		}
 		if s.saveCredential(a, sink) != nil {
@@ -395,7 +410,7 @@ func (s *store) reconcile(snap Snapshot, sink Sink) (err error) {
 	st := s.state
 	st.Managed = make([]string, 0, len(snap.Accounts))
 	for _, a := range snap.Accounts {
-		st.Managed = append(st.Managed, a.AccountID)
+		st.Managed = append(st.Managed, a.CredentialID)
 	}
 	sort.Strings(st.Managed)
 	if s.save(st) != nil {
@@ -410,7 +425,7 @@ func (s *store) audit(snap *Snapshot) error {
 	if snap != nil {
 		for _, a := range snap.Accounts {
 			if !a.Disabled {
-				wanted[a.AccountID] = a
+				wanted[a.CredentialID] = a
 			}
 		}
 	}

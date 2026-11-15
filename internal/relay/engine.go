@@ -26,7 +26,10 @@ var ErrExport = errors.New("relay export unavailable")
 // request callback ID. Stop joins the worker before releasing that context.
 type Source interface {
 	List() ([]Entry, error)
-	Get(index string) ([]byte, error)
+	Get(entry Entry) ([]byte, error)
+	// Removed proves a formerly listed physical source is absent, not merely
+	// hidden by host credential parsing. It must not read credential content.
+	Removed(path string) (bool, error)
 }
 type Sink interface {
 	Save(name string, raw []byte) (string, error)
@@ -38,6 +41,7 @@ type Sink interface {
 type Entry struct {
 	Index, Name, Path            string
 	Codex, RuntimeOnly, Disabled bool
+	UnknownProvider              bool
 }
 
 type Status struct {
@@ -368,7 +372,7 @@ func (e *Engine) checkModels() {
 	paths := []string{}
 	for _, a := range e.snapshot.Accounts {
 		if !a.Disabled {
-			paths = append(paths, filepath.Join(e.cfg.AuthDir, e.store.filename(a.AccountID)))
+			paths = append(paths, filepath.Join(e.cfg.AuthDir, e.store.filename(a.CredentialID)))
 		}
 	}
 	okay, err := e.sink.ModelsReady(paths)
@@ -500,47 +504,56 @@ func (e *Engine) Export(now time.Time) ([]byte, error) {
 		return nil, ErrExport
 	}
 	entries, err := e.source.List()
-	if err != nil || len(entries) > 4096 {
-		return nil, ErrExport
-	}
-	entries, err = selectSources(entries, e.cfg.SourceFiles)
 	if err != nil {
 		return nil, ErrExport
 	}
-	s := Snapshot{Version: 1, Generation: now.UnixNano(), GeneratedAt: now, Accounts: []Account{}}
+	entries, err = discoverSources(entries)
+	if err != nil {
+		return nil, ErrExport
+	}
+	s := Snapshot{Version: 2, Generation: now.UnixNano(), GeneratedAt: now, Accounts: []Account{}}
 	seen := map[string]bool{}
 	for _, entry := range entries {
 		if !entry.Codex || entry.RuntimeOnly {
 			continue
 		}
-		raw, err := e.source.Get(entry.Index)
+		raw, err := e.source.Get(entry)
 		if err != nil {
 			return nil, ErrExport
 		}
-		id, err := SourceIdentity(raw)
+		// Explicitly disabled records withdraw even when their token has become
+		// unusable. Still require valid duplicate-free JSON and Codex type.
+		m, err := sourceObject(raw)
 		if err != nil {
 			return nil, ErrExport
 		}
-		if !e.cfg.selected(id) {
-			if len(e.cfg.SourceFiles) != 0 {
+		var kind string
+		var disabled bool
+		if json.Unmarshal(m["type"], &kind) != nil || kind != "codex" {
+			return nil, ErrExport
+		}
+		if v, ok := m["disabled"]; ok {
+			if string(v) == "null" || json.Unmarshal(v, &disabled) != nil {
 				return nil, ErrExport
 			}
+		}
+		if entry.Disabled || disabled {
 			continue
 		}
 		a, err := Sanitize(raw)
-		if err != nil {
+		if err != nil || !accountFieldsValid(a) {
 			return nil, ErrExport
 		}
-		if seen[a.AccountID] {
+		a.CredentialID = credentialID(entry.Path)
+		if seen[a.CredentialID] {
 			return nil, ErrExport
 		}
-		seen[a.AccountID] = true
-		a.Disabled = a.Disabled || entry.Disabled
+		seen[a.CredentialID] = true
 		expiry, err := a.expires()
 		if err != nil {
 			return nil, ErrExport
 		}
-		// Expired selected accounts are absent from this full snapshot.
+		// Well-formed expired credentials are absent from the full snapshot.
 		if !now.Add(time.Duration(e.cfg.ExpirySkewSeconds) * time.Second).Before(expiry) {
 			continue
 		}
@@ -549,13 +562,39 @@ func (e *Engine) Export(now time.Time) ([]byte, error) {
 		}
 		s.Accounts = append(s.Accounts, a)
 	}
-	sort.Slice(s.Accounts, func(i, j int) bool { return s.Accounts[i].AccountID < s.Accounts[j].AccountID })
+	// Detect additions, removals, reindexing and disabling during the read pass.
+	// A list/read error is never converted into an authoritative empty snapshot.
+	after, err := e.source.List()
+	if err != nil {
+		return nil, ErrExport
+	}
+	after, err = discoverSources(after)
+	if err != nil || !sameSources(entries, after) {
+		return nil, ErrExport
+	}
+	paths := make([]string, 0, len(entries))
+	present := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		paths = append(paths, entry.Path)
+		present[entry.Path] = true
+	}
+	for _, path := range e.store.state.SourcePaths {
+		if present[path] {
+			continue
+		}
+		removed, err := e.source.Removed(path)
+		if err != nil || !removed {
+			return nil, ErrExport
+		}
+	}
+	sort.Slice(s.Accounts, func(i, j int) bool { return s.Accounts[i].CredentialID < s.Accounts[j].CredentialID })
 	raw, err := json.Marshal(s)
 	if err != nil || len(raw) > MaxBody-16384 {
 		return nil, ErrExport
 	}
 	st := e.store.state
 	st.Watermark = s.Generation
+	st.SourcePaths = paths
 	if e.store.save(st) != nil {
 		return nil, ErrExport
 	}

@@ -16,13 +16,14 @@ var ErrSnapshot = errors.New("invalid relay snapshot")
 
 // Account is deliberately a fixed allowlist, never an arbitrary metadata map.
 type Account struct {
-	Type        string `json:"type"`
-	AccessToken string `json:"access_token"`
-	AccountID   string `json:"account_id"`
-	Expired     string `json:"expired"`
-	Email       string `json:"email,omitempty"`
-	PlanType    string `json:"plan_type,omitempty"`
-	Disabled    bool   `json:"disabled"`
+	CredentialID string `json:"credential_id,omitempty"`
+	Type         string `json:"type"`
+	AccessToken  string `json:"access_token"`
+	AccountID    string `json:"account_id"`
+	Expired      string `json:"expired"`
+	Email        string `json:"email,omitempty"`
+	PlanType     string `json:"plan_type,omitempty"`
+	Disabled     bool   `json:"disabled"`
 }
 
 type Snapshot struct {
@@ -104,15 +105,15 @@ func DecodeSnapshot(raw []byte, c Config, now time.Time) (Snapshot, error) {
 }
 
 func Validate(s Snapshot, c Config, now time.Time) error {
-	if s.Version != 1 || s.Generation <= 0 || s.GeneratedAt.IsZero() || s.Generation != s.GeneratedAt.UnixNano() || s.GeneratedAt.After(now.Add(5*time.Second)) || !now.Before(s.GeneratedAt.Add(time.Duration(c.MaxStaleSeconds)*time.Second)) || s.Accounts == nil || len(s.Accounts) > MaxAccounts {
+	if s.Version != 2 || s.Generation <= 0 || s.GeneratedAt.IsZero() || s.Generation != s.GeneratedAt.UnixNano() || s.GeneratedAt.After(now.Add(5*time.Second)) || !now.Before(s.GeneratedAt.Add(time.Duration(c.MaxStaleSeconds)*time.Second)) || s.Accounts == nil || len(s.Accounts) > MaxAccounts {
 		return ErrSnapshot
 	}
 	seen := map[string]bool{}
 	for _, a := range s.Accounts {
-		if !c.selected(a.AccountID) || seen[a.AccountID] || validateAccount(a, now, c.ExpirySkewSeconds) != nil {
+		if !credentialPattern.MatchString(a.CredentialID) || seen[a.CredentialID] || validateAccount(a, now, c.ExpirySkewSeconds) != nil {
 			return ErrSnapshot
 		}
-		seen[a.AccountID] = true
+		seen[a.CredentialID] = true
 	}
 	return nil
 }
@@ -121,8 +122,12 @@ func textOK(s string, max int) bool {
 	return len(s) <= max && !strings.ContainsFunc(s, unicode.IsControl)
 }
 
+func accountFieldsValid(a Account) bool {
+	return a.Type == "codex" && idPattern.MatchString(a.AccountID) && textOK(a.Email, 320) && textOK(a.PlanType, 64) && textOK(a.AccessToken, 16384)
+}
+
 func validateAccount(a Account, now time.Time, skew int) error {
-	if a.Type != "codex" || !idPattern.MatchString(a.AccountID) || !textOK(a.Email, 320) || !textOK(a.PlanType, 64) || len(a.AccessToken) > 16384 || !textOK(a.AccessToken, 16384) {
+	if !accountFieldsValid(a) {
 		return ErrSnapshot
 	}
 	expiry, e := a.expires()
@@ -177,20 +182,6 @@ func (a Account) expires() (time.Time, error) {
 		return jwt, nil
 	}
 	return explicit, nil
-}
-
-// SourceIdentity validates structure and identity before interpreting unrelated
-// token/optional fields. Missing, invalid or ambiguous identities fail closed.
-func SourceIdentity(raw []byte) (string, error) {
-	m, err := sourceObject(raw)
-	if err != nil {
-		return "", err
-	}
-	var id string
-	if json.Unmarshal(m["account_id"], &id) != nil || !idPattern.MatchString(id) {
-		return "", ErrSnapshot
-	}
-	return id, nil
 }
 
 func sourceObject(raw []byte) (map[string]json.RawMessage, error) {

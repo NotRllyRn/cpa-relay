@@ -33,7 +33,7 @@ func appConfig(t *testing.T, role string) string {
 	t.Helper()
 	dir := t.TempDir()
 	t.Setenv("CPA_RELAY_TEST_BEARER", base64.RawURLEncoding.EncodeToString([]byte(strings.Repeat("x", 32))))
-	config := fmt.Sprintf("enabled: true\nrole: %s\nsecret_env: CPA_RELAY_TEST_BEARER\naccounts: [acct-a]\nstate_dir: %s\n", role, filepath.Join(dir, "state"))
+	config := fmt.Sprintf("enabled: true\nrole: %s\nsecret_env: CPA_RELAY_TEST_BEARER\nstate_dir: %s\n", role, filepath.Join(dir, "state"))
 	if role == "receiver" {
 		auth := filepath.Join(dir, "auth")
 		os.Mkdir(auth, 0700)
@@ -74,7 +74,7 @@ func TestInvalidSettingsKeepCapabilitiesGateAndPublicReadiness(t *testing.T) {
 }
 
 func TestExporterBridgeReadOnlyAndSecretFreeUI(t *testing.T) {
-	config := appConfig(t, "exporter") + "source_files: [chosen.json]\n"
+	config := appConfig(t, "exporter")
 	var mu sync.Mutex
 	var methods []string
 	now := time.Now()
@@ -88,12 +88,12 @@ func TestExporterBridgeReadOnlyAndSecretFreeUI(t *testing.T) {
 		mu.Unlock()
 		switch method {
 		case pluginabi.MethodHostAuthList:
-			json.Unmarshal(encoded(map[string]any{"files": []any{pluginapi.HostAuthFileEntry{AuthIndex: "index", Name: "chosen.json", Path: path, Type: "codex"}, pluginapi.HostAuthFileEntry{AuthIndex: "other", Name: "other.json", Path: "/example/auth/other.json", Type: "codex"}}}), dst)
+			json.Unmarshal(encoded(map[string]any{"files": []any{pluginapi.HostAuthFileEntry{AuthIndex: "index", Name: "chosen.json", Path: path, Type: "codex"}, pluginapi.HostAuthFileEntry{AuthIndex: "other", Name: "other.json", Path: "/example/auth/other.json", Type: "other"}}}), dst)
 		case pluginabi.MethodHostAuthGet:
 			if request.(pluginapi.HostAuthGetRequest).AuthIndex != "index" {
 				return errors.New("unselected source read")
 			}
-			json.Unmarshal(encoded(pluginapi.HostAuthGetResponse{JSON: encoded(credential)}), dst)
+			json.Unmarshal(encoded(pluginapi.HostAuthGetResponse{AuthIndex: "index", Name: "chosen.json", Path: path, JSON: encoded(credential)}), dst)
 		default:
 			return errors.New("unexpected callback")
 		}
@@ -118,10 +118,9 @@ func TestExporterBridgeReadOnlyAndSecretFreeUI(t *testing.T) {
 			t.Fatal("UI/status leak")
 		}
 	}
-	// Stock Name trims whitespace from the physical filename. Without the
-	// intended file, a same-workspace alias must fail before any Get.
+	// Stock Get trims the path before reading: refuse a path it would alter.
 	mu.Lock()
-	physicalPath = "/example/auth/ chosen.json"
+	physicalPath = "/example/auth/chosen.json "
 	mu.Unlock()
 	decodeResult(t, invoke(a, "GET", relay.SnapshotPath, http.Header{"Authorization": {"Bearer " + secret}}), &response)
 	if response.StatusCode != 503 {

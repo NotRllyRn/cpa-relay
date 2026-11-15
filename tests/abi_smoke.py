@@ -88,7 +88,8 @@ def main():
         lock = threading.Lock()
         buffers, runtime, calls, callback_errors = {}, {}, [], []
         control = {"fail_disabled": 0, "disabled_attempts": 0, "models_missing": True,
-                   "source_path": str(root / "source" / "chosen.json")}
+                   "source_path": str(root / "source" / "chosen.json"), "extra": False}
+        second = dict(credential, email="second@example.invalid")
         auth = root / "auth"
         auth.mkdir(mode=0o700)
         main_thread = threading.get_ident()
@@ -104,7 +105,7 @@ def main():
                 if method == "host.auth.list":
                     with lock:
                         result = {"files": [{"auth_index": "index-a", "type": "codex", "name": "chosen.json",
-                                              "path": control["source_path"]}] + [
+                                              "path": control["source_path"]}] + ([{"auth_index": "index-b", "type": "codex", "name": "second.json", "path": str(root / "source/second.json")}] if control["extra"] else []) + [
                             {"id": n, "name": n, "path": str(auth / n), "auth_index": "runtime-"+n,
                              "provider": "codex", "status": "active", "disabled": a["disabled"]}
                             for n, a in runtime.items()]}
@@ -114,7 +115,10 @@ def main():
                             "provider": "codex", "models": [] if a["disabled"] or control["models_missing"] else ["test-model"]}
                             for n, a in runtime.items()]}
                 elif method == "host.auth.get":
-                    result = {"json": credential}
+                    index = request["auth_index"]
+                    path = control["source_path"] if index == "index-a" else str(root / "source/second.json")
+                    result = {"auth_index": index, "name": pathlib.Path(path).name.strip(), "path": path,
+                              "json": credential if index == "index-a" else second}
                 elif method == "host.auth.save":
                     name, data = request["name"], request["json"]
                     assert pathlib.Path(name).name == name
@@ -183,22 +187,28 @@ def main():
         def ready():
             return management("/v0/resource/plugins/cpa-relay/ready")[0] == 200
 
-        common = {"enabled": True, "secret_env": "CPA_RELAY_ABI_SECRET", "accounts": ["acct-a"], "poll_seconds": 15}
-        configure(dict(common, role="exporter", state_dir=str(root / "exporter"), source_files=["chosen.json"]), "plugin.register")
+        common = {"enabled": True, "secret_env": "CPA_RELAY_ABI_SECRET", "poll_seconds": 15}
+        configure(dict(common, role="exporter", state_dir=str(root / "exporter")), "plugin.register")
         assert management("/v0/resource/plugins/cpa-relay/snapshot")[0] == 401
         status, body = management("/v0/resource/plugins/cpa-relay/snapshot", {"Authorization": ["Bearer " + bearer]})
         assert status == 200 and b"NEVER-RELAY" not in body, (status, management("/v0/management/cpa-relay/status")[1], callback_errors)
         snapshot = json.loads(body)
-        assert set(snapshot["accounts"][0]) == {"type", "account_id", "access_token", "expired", "disabled"}
+        assert set(snapshot["accounts"][0]) == {"credential_id", "type", "account_id", "access_token", "expired", "disabled"}
         assert not any(method == "host.auth.save" for method, _ in calls)
         assert b"chosen.json" not in body and b"/source/" not in body
         with lock:
             gets = sum(method == "host.auth.get" for method, _ in calls)
-            control["source_path"] = str(root / "source" / " chosen.json")
+            control["source_path"] = str(root / "source" / "chosen.json ")
         assert management("/v0/resource/plugins/cpa-relay/snapshot", {"Authorization": ["Bearer " + bearer]})[0] == 503
         with lock:
             assert sum(method == "host.auth.get" for method, _ in calls) == gets
             control["source_path"] = str(root / "source" / "chosen.json")
+            control["extra"] = True
+        status, body = management("/v0/resource/plugins/cpa-relay/snapshot", {"Authorization": ["Bearer " + bearer]})
+        snapshot = json.loads(body)
+        assert status == 200 and len(snapshot["accounts"]) == 2
+        assert len({a["credential_id"] for a in snapshot["accounts"]}) == 2
+        assert len({a["account_id"] for a in snapshot["accounts"]}) == 1
         routes = rpc("management.register", {})
         assert len(routes["resources"]) == 3 and len(routes["routes"]) == 3
 
@@ -247,9 +257,38 @@ def main():
             assert not rpc("request.intercept_before", {"Stream": True})["Terminate"]
             with lock:
                 assert any(m == "host.auth.save" and ident != main_thread for m, ident in calls)
-                assert len(runtime) == 1 and not next(iter(runtime.values()))["disabled"]
+                assert len(runtime) == 2 and all(not a["disabled"] for a in runtime.values())
                 assert any(m == "host.auth.models" and ident != main_thread for m, ident in calls)
-                control["fail_disabled"] = 3
+
+            def publish(accounts):
+                generation = time.time_ns()
+                snapshot.update(generation=generation, generated_at=stamp(generation), accounts=accounts)
+                with lock:
+                    remote["body"] = dumps(snapshot)
+                assert management("/v0/management/cpa-relay/poll", method="POST")[0] == 202
+                until(lambda: json.loads((root / "receiver/state.json").read_text())["watermark"] == generation and ready())
+
+            with lock:
+                saves_before = sum(m == "host.auth.save" for m, _ in calls)
+            mtimes = {p: p.stat().st_mtime_ns for p in auth.glob("*.json")}
+            publish(snapshot["accounts"])
+            with lock:
+                assert sum(m == "host.auth.save" for m, _ in calls) == saves_before
+            assert all(p.stat().st_mtime_ns == mtime for p, mtime in mtimes.items())
+            refreshed = [dict(a) for a in snapshot["accounts"]]
+            refreshed[0]["access_token"] = "e30." + base64.urlsafe_b64encode(dumps({"exp": now // 1_000_000_000 + 7201})).decode().rstrip("=") + ".refreshed"
+            publish(refreshed)
+            with lock:
+                assert sum(m == "host.auth.save" for m, _ in calls) == saves_before + 2
+            assert sum(p.stat().st_mtime_ns != mtime for p, mtime in mtimes.items()) == 1
+            publish(refreshed[1:])
+            assert len(list(auth.glob("*.json"))) == 1
+            with lock:
+                assert sum(not a["disabled"] for a in runtime.values()) == 1
+            publish(refreshed)  # rediscovery/addition restores both independent IDs
+            assert len(list(auth.glob("*.json"))) == 2
+            with lock:
+                control["fail_disabled"] = 6
                 before = control["disabled_attempts"]
             rpc("plugin.quiesce", {}, okay=False)
             assert not ready()
@@ -258,12 +297,12 @@ def main():
             assert not ready()
             assert management("/v0/management/cpa-relay/drain", method="POST")[0] == 503
             with lock:
-                assert control["disabled_attempts"] == before + 3
-                assert not next(iter(runtime.values()))["disabled"]
+                assert control["disabled_attempts"] == before + 6
+                assert any(not a["disabled"] for a in runtime.values())
             assert management("/v0/management/cpa-relay/drain", method="POST")[0] == 200
             with lock:
-                assert control["disabled_attempts"] == before + 4
-                assert next(iter(runtime.values()))["disabled"]
+                assert control["disabled_attempts"] == before + 8
+                assert all(a["disabled"] for a in runtime.values())
             assert not list(auth.glob("*.json"))
             assert json.loads((root / "receiver/state.json").read_text())["managed"] == []
             snapshot.update(generation=time.time_ns())
@@ -276,9 +315,9 @@ def main():
                 remote["status"] = 500
             management("/v0/management/cpa-relay/poll", method="POST")
             until(lambda: json.loads(management("/v0/management/cpa-relay/status")[1])["last_attempt"] == "fetch_failed")
-            assert ready() and len(list(auth.glob("*.json"))) == 1
+            assert ready() and len(list(auth.glob("*.json"))) == 2
             generation = time.time_ns()
-            empty = {"version": 1, "generation": generation, "generated_at": stamp(generation), "accounts": []}
+            empty = {"version": 2, "generation": generation, "generated_at": stamp(generation), "accounts": []}
             with lock:
                 remote.update(status=200, body=dumps(empty))
             management("/v0/management/cpa-relay/poll", method="POST")
@@ -304,7 +343,7 @@ def main():
             server.shutdown()
             server.server_close()
             server_thread.join(timeout=2)
-        print("PASS: native C ABI, export sanitization/auth, HTTPS pull, background save/models, delayed routes, gate, removal, replay, failed quiesce/reconfigure retained cleanup, authenticated drain, lifecycle, buffer ownership")
+        print("PASS: native C ABI, automatic same-workspace discovery, export sanitization/auth, HTTPS pull, background save/models, unchanged no-write, isolated refresh, add/remove/delete-all, delayed routes, gate, replay, failed quiesce/reconfigure retained cleanup, authenticated drain, lifecycle, buffer ownership")
 
 
 if __name__ == "__main__":

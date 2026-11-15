@@ -19,7 +19,7 @@ func TestRemovalRequiresRuntimeDisableAcknowledgement(t *testing.T) {
 		t.Fatal(err)
 	}
 	wait(t, e.Ready)
-	name := e.store.filename("acct-a")
+	name := e.store.filename(credentialID("acct-a"))
 	h.mu.Lock()
 	h.failDisabled = true
 	h.mu.Unlock()

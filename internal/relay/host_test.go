@@ -22,18 +22,21 @@ type mockHost struct {
 	beforeActive  func()
 	modelsMissing bool
 	modelsErr     bool
+	saves         int
 	beforeModels  func()
 }
 
-func diskHost(dir string) *mockHost            { return &mockHost{dir: dir, runtime: map[string]Account{}} }
-func (h *mockHost) List() ([]Entry, error)     { return nil, errors.New("unexpected read callback") }
-func (h *mockHost) Get(string) ([]byte, error) { return nil, errors.New("unexpected read callback") }
+func diskHost(dir string) *mockHost              { return &mockHost{dir: dir, runtime: map[string]Account{}} }
+func (h *mockHost) List() ([]Entry, error)       { return nil, errors.New("unexpected read callback") }
+func (h *mockHost) Removed(string) (bool, error) { return true, nil }
+func (h *mockHost) Get(Entry) ([]byte, error)    { return nil, errors.New("unexpected read callback") }
 func (h *mockHost) Save(name string, raw []byte) (string, error) {
 	var a Account
 	if json.Unmarshal(raw, &a) != nil {
 		return "", ErrStorage
 	}
 	h.mu.Lock()
+	h.saves++
 	hook := h.beforeActive
 	fail := h.failActive
 	failDisabled := h.failDisabled
@@ -127,7 +130,7 @@ func TestRuntimeAcknowledgementAndRemovalBeforeReadiness(t *testing.T) {
 	if e.Ready() || !e.Gate() {
 		t.Fatal("empty snapshot ready")
 	}
-	name := e.store.filename("acct-a")
+	name := e.store.filename(credentialID("acct-a"))
 	if !h.disabled(name) {
 		t.Fatal("physical removal without runtime disable acknowledgement")
 	}
@@ -156,7 +159,7 @@ func TestRuntimeUpdateErrorAndConcurrentContaminationFailReadiness(t *testing.T)
 			if e.Ready() || !e.Gate() {
 				t.Fatal("unsafe runtime state ready")
 			}
-			if !h.disabled(e.store.filename("acct-a")) {
+			if !h.disabled(e.store.filename(credentialID("acct-a"))) {
 				t.Fatal("failed update not synchronously disabled")
 			}
 		})
@@ -175,7 +178,7 @@ func TestContaminatedOwnedRecordRejected(t *testing.T) {
 	if s.accept(snap) != nil || s.reconcile(snap, h) != nil {
 		t.Fatal("initial reconcile")
 	}
-	path := filepath.Join(c.AuthDir, s.filename("acct-a"))
+	path := filepath.Join(c.AuthDir, s.filename(credentialID("acct-a")))
 	a := snap.Accounts[0]
 	var m map[string]any
 	json.Unmarshal(marshal(t, a), &m)
@@ -190,7 +193,7 @@ func TestContaminatedOwnedRecordRejected(t *testing.T) {
 	if s.withdrawRuntime(h) != nil {
 		t.Fatal("could not disable contaminated owned record")
 	}
-	if !h.disabled(s.filename("acct-a")) {
+	if !h.disabled(s.filename(credentialID("acct-a"))) {
 		t.Fatal("contaminated runtime still enabled")
 	}
 }

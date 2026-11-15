@@ -13,10 +13,10 @@ func token(exp time.Time) string {
 	return "e30." + base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, exp.Unix()))) + ".test-signature"
 }
 func account(now time.Time, id string) Account {
-	return Account{Type: "codex", AccountID: id, AccessToken: token(now.Add(2 * time.Hour)), Expired: now.Add(time.Hour).UTC().Format(time.RFC3339Nano)}
+	return Account{CredentialID: credentialID(id), Type: "codex", AccountID: id, AccessToken: token(now.Add(2 * time.Hour)), Expired: now.Add(time.Hour).UTC().Format(time.RFC3339Nano)}
 }
 func snapshot(now time.Time, ids ...string) Snapshot {
-	s := Snapshot{Version: 1, Generation: now.UnixNano(), GeneratedAt: now.UTC(), Accounts: []Account{}}
+	s := Snapshot{Version: 2, Generation: now.UnixNano(), GeneratedAt: now.UTC(), Accounts: []Account{}}
 	for _, id := range ids {
 		s.Accounts = append(s.Accounts, account(now, id))
 	}
@@ -31,7 +31,7 @@ func marshal(t *testing.T, v any) []byte {
 	return b
 }
 func protocolConfig() Config {
-	return Config{Accounts: []string{"acct-a", "acct-b"}, PollSeconds: 15, MaxStaleSeconds: 3600, ExpirySkewSeconds: 60}
+	return Config{PollSeconds: 15, MaxStaleSeconds: 3600, ExpirySkewSeconds: 60}
 }
 
 func TestSanitizeNeverCopiesSecrets(t *testing.T) {
@@ -52,6 +52,7 @@ func TestSanitizeNeverCopiesSecrets(t *testing.T) {
 	if strings.Contains(string(marshal(t, got)), "DO-NOT-RELAY") {
 		t.Fatal("secret leaked")
 	}
+	a.CredentialID = "" // Never trust a credential_id supplied by a physical source.
 	if got != a {
 		t.Fatal("allowed fields changed")
 	}
@@ -65,17 +66,18 @@ func TestStrictSnapshot(t *testing.T) {
 		t.Fatal(e)
 	}
 	cases := map[string]func(*Snapshot){
-		"version":         func(s *Snapshot) { s.Version = 2 },
-		"generation":      func(s *Snapshot) { s.Generation++ },
-		"future":          func(s *Snapshot) { s.GeneratedAt = now.Add(6 * time.Second); s.Generation = s.GeneratedAt.UnixNano() },
-		"stale":           func(s *Snapshot) { s.GeneratedAt = now.Add(-time.Hour); s.Generation = s.GeneratedAt.UnixNano() },
-		"duplicate":       func(s *Snapshot) { s.Accounts = append(s.Accounts, s.Accounts[0]) },
-		"not selected":    func(s *Snapshot) { s.Accounts[0].AccountID = "other" },
-		"traversal":       func(s *Snapshot) { s.Accounts[0].AccountID = "../acct-a" },
-		"type":            func(s *Snapshot) { s.Accounts[0].Type = "other" },
-		"explicit expiry": func(s *Snapshot) { s.Accounts[0].Expired = now.Add(60 * time.Second).Format(time.RFC3339Nano) },
-		"jwt expiry":      func(s *Snapshot) { s.Accounts[0].AccessToken = token(now.Add(30 * time.Second)) },
-		"non jwt":         func(s *Snapshot) { s.Accounts[0].AccessToken = "opaque-token" },
+		"version":           func(s *Snapshot) { s.Version = 1 },
+		"generation":        func(s *Snapshot) { s.Generation++ },
+		"future":            func(s *Snapshot) { s.GeneratedAt = now.Add(6 * time.Second); s.Generation = s.GeneratedAt.UnixNano() },
+		"stale":             func(s *Snapshot) { s.GeneratedAt = now.Add(-time.Hour); s.Generation = s.GeneratedAt.UnixNano() },
+		"duplicate":         func(s *Snapshot) { s.Accounts = append(s.Accounts, s.Accounts[0]) },
+		"missing source ID": func(s *Snapshot) { s.Accounts[0].CredentialID = "" },
+		"unsafe source ID":  func(s *Snapshot) { s.Accounts[0].CredentialID = "../file" },
+		"traversal":         func(s *Snapshot) { s.Accounts[0].AccountID = "../acct-a" },
+		"type":              func(s *Snapshot) { s.Accounts[0].Type = "other" },
+		"explicit expiry":   func(s *Snapshot) { s.Accounts[0].Expired = now.Add(60 * time.Second).Format(time.RFC3339Nano) },
+		"jwt expiry":        func(s *Snapshot) { s.Accounts[0].AccessToken = token(now.Add(30 * time.Second)) },
+		"non jwt":           func(s *Snapshot) { s.Accounts[0].AccessToken = "opaque-token" },
 		"jwt whitespace": func(s *Snapshot) {
 			s.Accounts[0].AccessToken = "bad header." + strings.Split(s.Accounts[0].AccessToken, ".")[1] + ".signature"
 		},
@@ -92,7 +94,7 @@ func TestStrictSnapshot(t *testing.T) {
 		})
 	}
 	for _, raw := range []string{
-		strings.Replace(string(marshal(t, valid)), `"version":1`, `"version":1,"version":1`, 1),
+		strings.Replace(string(marshal(t, valid)), `"version":2`, `"version":2,"version":2`, 1),
 		strings.Replace(string(marshal(t, valid)), `"type":"codex"`, `"type":"codex","refresh_token":"not-allowed"`, 1),
 		string(marshal(t, valid)) + ` {}`,
 		string(marshal(t, valid)) + strings.Repeat(" ", MaxBody),

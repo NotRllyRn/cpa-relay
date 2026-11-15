@@ -11,52 +11,36 @@ import (
 	"time"
 )
 
-func TestExporterSelectsIdentityBeforeUnrelatedFields(t *testing.T) {
+func TestExporterRejectsMalformedActiveCodexFields(t *testing.T) {
 	now := time.Now()
 	for _, bad := range []string{
 		`"access_token":123`, `"expired":[]`, `"email":{}`, `"disabled":"bad"`, `"plan_type":false`, `"type":null`,
 		`"access_token":null`, `"email":null`, `"disabled":null`, `"plan_type":null`,
+		`"account_id":123`, `"account_id":null`, `"account_id":"../unsafe"`,
 	} {
 		t.Run(bad, func(t *testing.T) {
-			for _, selected := range []bool{false, true} {
-				id := "acct-b"
-				if selected {
-					id = "acct-a"
-				}
-				var other, patch map[string]any
-				json.Unmarshal(marshal(t, account(now, id)), &other)
-				json.Unmarshal([]byte(`{`+bad+`}`), &patch)
-				for k, v := range patch {
-					other[k] = v
-				}
-				c := diskConfig(t, "exporter")
-				c.Accounts = []string{"acct-a"}
-				src := fakeSource{entries: []Entry{{Index: "b", Codex: true}}, raw: map[string][]byte{"a": marshal(t, account(now, "acct-a")), "b": marshal(t, other)}}
-				if !selected {
-					src.entries = append(src.entries, Entry{Index: "a", Codex: true})
-				}
-				e, err := New(c, secret(), src)
-				if err != nil {
-					t.Fatal(err)
-				}
-				b, err := e.Export(now)
-				if selected {
-					if err != ErrExport {
-						t.Fatal("selected malformed credential did not fail closed")
-					}
-				} else if err != nil || strings.Contains(string(b), "acct-b") {
-					t.Fatal("unselected optional/token field affected export")
-				}
-				e.Stop()
+			var other, patch map[string]any
+			json.Unmarshal(marshal(t, account(now, "acct-a")), &other)
+			json.Unmarshal([]byte(`{`+bad+`}`), &patch)
+			for k, v := range patch {
+				other[k] = v
+			}
+			c := diskConfig(t, "exporter")
+			src := fakeSource{entries: []Entry{{Index: "a", Name: "a.json", Path: "/auth/a.json", Codex: true}, {Index: "b", Name: "b.json", Path: "/auth/b.json", Codex: true}}, raw: map[string][]byte{"a": marshal(t, account(now, "acct-a")), "b": marshal(t, other)}}
+			e, err := New(c, secret(), src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer e.Stop()
+			if _, err = e.Export(now); err != ErrExport {
+				t.Fatal("malformed active Codex credential did not fail closed")
 			}
 		})
 	}
-	for _, raw := range []string{
-		`{}`, `[]`, `{"account_id":123}`, `{"account_id":"acct-b","account_id":"acct-a"}`,
-		`{"account_id":"acct-b","ACCOUNT_ID":"acct-a"}`, `{"ACCOUNT_ID":"acct-b"}`,
-		`{"account_id":"acct-b","x":{"a":1,"a":2}}`,
-	} {
-		if _, err := SourceIdentity([]byte(raw)); err == nil {
+	valid := strings.TrimSuffix(string(marshal(t, account(now, "acct-a"))), "}")
+	for _, raw := range []string{`{}`, `[]`, valid + `,"account_id":"acct-b"}`, valid + `,"ACCOUNT_ID":"acct-a"}`, valid + `,"x":{"a":1,"a":2}}`} {
+		a, err := Sanitize([]byte(raw))
+		if err == nil && accountFieldsValid(a) {
 			t.Fatal("ambiguous or invalid identity accepted")
 		}
 	}
@@ -154,7 +138,7 @@ func TestStopRetainsFailedCleanupAndRetries(t *testing.T) {
 		t.Fatal(err)
 	}
 	wait(t, e.Ready)
-	name := e.store.filename("acct-a")
+	name := e.store.filename(credentialID("acct-a"))
 	h.mu.Lock()
 	h.failDisabled = true
 	h.mu.Unlock()
@@ -241,7 +225,7 @@ func TestRuntimeQuarantineStopsPollingButRetriesContainment(t *testing.T) {
 		}
 	}()
 	wait(t, e.Ready)
-	name := e.store.filename("acct-a")
+	name := e.store.filename(credentialID("acct-a"))
 	path := filepath.Join(c.AuthDir, name)
 	h.mu.Lock()
 	h.failDisabled = true
@@ -303,7 +287,7 @@ func TestTerminatedWorkerRejectsTrigger(t *testing.T) {
 	if s.accept(snap) != nil {
 		t.Fatal("seed")
 	}
-	if err := os.WriteFile(filepath.Join(c.AuthDir, s.filename("acct-a")), []byte(`{"refresh_token":"not-adopted"}`), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(c.AuthDir, s.filename(credentialID("acct-a"))), []byte(`{"refresh_token":"not-adopted"}`), 0600); err != nil {
 		t.Fatal(err)
 	}
 	s.close()

@@ -35,7 +35,6 @@ func TestConfigValidation(t *testing.T) {
 role: receiver
 secret_env: CPA_RELAY_TEST_SECRET
 endpoint: https://primary.example.invalid/v0/resource/plugins/cpa-relay/snapshot
-accounts: [acct-a]
 state_dir: /var/lib/example-relay
 auth_dir: /var/lib/example-cpa-auth
 receiver_id: secondary
@@ -49,9 +48,7 @@ receiver_id: secondary
 		strings.Replace(base, "primary.example.invalid/", "user:password@primary.example.invalid/", 1),
 		strings.Replace(base, "/snapshot", "/snapshot?token=bad", 1),
 		strings.Replace(base, "/snapshot", "/snapshot#fragment", 1),
-		strings.Replace(base, "[acct-a]", "[]", 1),
-		strings.Replace(base, "[acct-a]", "[acct-a, acct-a]", 1),
-		strings.Replace(base, "[acct-a]", "[../bad]", 1),
+		base + "accounts: []\n", base + "source_files: []\n",
 		strings.Replace(base, "state_dir: /var/lib/example-relay", "state_dir: relative", 1),
 		strings.Replace(base, "state_dir: /var/lib/example-relay", "state_dir: /var/lib/example-cpa-auth/nested", 1),
 		base + "poll_seconds: 0\n", base + "max_stale_seconds: 10\n", base + "expiry_skew_seconds: 0\n", base + "secret: inline-not-allowed\n", base + "---\nrole: exporter\n",
@@ -84,7 +81,7 @@ func TestStoreOwnershipAtomicCacheAndRestart(t *testing.T) {
 	if err = s.reconcile(snap, diskHost(c.AuthDir)); err != nil {
 		t.Fatal(err)
 	}
-	name := s.filename("acct-a")
+	name := s.filename(credentialID("acct-a"))
 	if !ReservedNames(c.ReceiverID, name) || strings.Contains(name, "acct-a") {
 		t.Fatal("unsafe filename")
 	}
@@ -127,7 +124,7 @@ func TestStoreRejectsCollisionSymlinkCorruptionAndAuthorityChange(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	name := s.filename("acct-a")
+	name := s.filename(credentialID("acct-a"))
 	path := filepath.Join(c.AuthDir, name)
 	os.WriteFile(path, []byte("manual"), 0600)
 	if s.accept(snapshot(time.Now(), "acct-a")) == nil {
@@ -186,7 +183,7 @@ func TestStorePartialWriteFailureKeepsInventory(t *testing.T) {
 		t.Fatal("accept")
 	}
 	// Simulate a path becoming unwritable after durable write-ahead inventory.
-	os.Mkdir(filepath.Join(c.AuthDir, s.filename("acct-b")), 0700)
+	os.Mkdir(filepath.Join(c.AuthDir, s.filename(credentialID("acct-b"))), 0700)
 	if s.reconcile(snap, diskHost(c.AuthDir)) == nil {
 		t.Fatal("write failure not reported")
 	}
@@ -196,7 +193,7 @@ func TestStorePartialWriteFailureKeepsInventory(t *testing.T) {
 	if s.withdrawRuntime(diskHost(c.AuthDir)) == nil {
 		t.Fatal("cleanup failure not reported")
 	}
-	os.Remove(filepath.Join(c.AuthDir, s.filename("acct-b")))
+	os.Remove(filepath.Join(c.AuthDir, s.filename(credentialID("acct-b"))))
 	if s.withdrawRuntime(diskHost(c.AuthDir)) != nil {
 		t.Fatal("cleanup retry failed")
 	}

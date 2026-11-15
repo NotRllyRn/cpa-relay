@@ -1,32 +1,33 @@
 # Setup
 
-Read [security requirements](security.md) before enabling either role. Examples below are fragments to merge into separate CPA v8.0.63 configurations, not complete server configurations. Paths, hostnames and account IDs are fictional.
+Read [security requirements](security.md) before enabling either role. These are fragments for separate stock CPA v8.0.63 configurations, not complete server configurations. All paths and hostnames are fictional. Existing installations must follow the [v1 migration](#migrate-from-v1-explicit-selection) before replacing the binary.
 
 ## Build and install
 
-Requirements: Linux amd64, C compiler, Make, Go toolchain download access. `make` pins Go 1.26.10; dependencies are pinned in `go.mod`/`go.sum`, with no local replacements. Python 3 and OpenSSL are needed for the ABI test.
+Requirements: Linux amd64, C compiler, Make, Go toolchain download access. `make` pins Go 1.26.10; dependencies are pinned in `go.mod`/`go.sum`. Python 3 and OpenSSL are needed for the ABI test.
 
 ```sh
 make check
+make stock-smoke # optional isolated Docker integration; synthetic credentials only
 ```
 
-This runs unit tests, race detection, vet, a native `c-shared` build and an HTTPS/native-callback smoke test. Install only `dist/cpa-relay.so` in the existing CPA plugin directory. Keep that exact filename: CPA derives the plugin ID and resource URLs from it. The generated C header is not needed by CPA.
+Install only `dist/cpa-relay.so` in the existing CPA plugin directory. Keep that exact filename: CPA derives its plugin ID and resource URLs from it. The generated C header is not needed. No command in this repository installs or restarts production services.
 
-`GOAMD64=v1` and baseline C flags avoid requiring AVX/x86-64-v2. This does **not** make libc portable: build on the oldest compatible libc used by your hosts, or inside the matching deployment image. A glibc build is not a musl build. CPU/libc compatibility and the real CPA binary must be tested before rollout. No other OS/architecture is claimed supported.
+Baseline `GOAMD64=v1` avoids AVX/x86-64-v2 requirements, but does not make libc portable. Build against the deployment libc (glibc and musl builds are not interchangeable). Test CPU/libc compatibility and the real CPA binary before rollout. No other OS/architecture is claimed supported.
 
-Before installation or config changes, back up the existing plugin, CPA config and relay state outside this repository with restricted permissions. This repository does not install or restart anything automatically.
+Before installation or config changes, back up plugin, CPA config and private relay state outside the repository with restricted permissions and original ownership/modes. Record exact restore commands for that deployment.
 
 ## Prepare both processes
 
-1. Obtain the Codex `account_id` values from the primary's credentials through a secure local/admin workflow. Select account IDs explicitly in `accounts` on **both** roles; an empty selection is invalid. An `account_id` can identify a shared workspace, not a unique login/email. If several primary files share it, also select the intended physical basename in exporter-only `source_files`; never put a filename/email/auth index in `accounts`.
-2. Generate a dedicated secret locally, for example with Python's `secrets.token_urlsafe(32)`. Put its value in a protected service/container environment on both processes as `CPA_RELAY_BEARER`. Do not put it in YAML, shell history, URLs, browser fields or this repository. The accepted encoding is unpadded base64url representing 32–128 bytes. Randomness cannot be measured by the plugin; the operator must generate it securely.
-3. Start CPA with that environment already set. Native Go plugins read the process startup environment; changing an external environment file does not update a running process. Rotation requires coordinated process restarts. A secret is shared only by the intended primary/receiver pair.
-4. Provision explicit absolute state directories, owned by CPA's Unix user, mode `0700`. They must not contain symlinked path components. Ancestors must be owned by root or the CPA user and not be group/world writable (root-owned sticky directories such as `/tmp` are allowed). Receiver auth-dir must already exist, be owned by the same Unix user and not be group/world writable. The two directories may not contain each other. Do not put exporter state inside its CPA auth-dir either.
-5. Require a valid HTTPS certificate on the primary's existing listener. System trust roots are used; a private CA must be installed in the receiver's trust store **before startup**. No insecure-TLS switch, HTTP endpoint, ambient HTTP proxy, or redirect is supported.
+1. Authorize distribution of **all physical Codex credentials** on this primary, including credentials added later. There is no per-account or per-file selector. A workspace `account_id` is not a login identity; multiple logins sharing it are supported. Use a separate primary instance if some Codex credentials must not be shared.
+2. Generate a dedicated secret locally, for example with Python's `secrets.token_urlsafe(32)`. Put it in the protected process startup environment as `CPA_RELAY_BEARER` on both roles. Never put the value in YAML, shell history, URLs, browser fields or the repository. The accepted encoding is unpadded base64url representing 32–128 bytes; the operator must generate it securely.
+3. Start CPA with that environment already set. Native Go plugins snapshot the startup environment. External environment-file changes do not update a running process; rotate with coordinated process restarts. Share the secret only with intended receivers.
+4. Provision explicit absolute state directories owned by CPA's Unix user, mode `0700`, with no symlinked components. Ancestors must be owned by root or that user and not group/world writable (root-owned sticky `/tmp` is allowed). Receiver auth-dir must already exist, be owned by the same user and not group/world writable. Auth-dir and state-dir must not contain each other. Do not put exporter state inside its auth-dir either.
+5. Require valid primary HTTPS and install any private CA into the receiver trust store **before startup**. There is no insecure TLS, HTTP, proxy or redirect option.
 
 ## Exporter
 
-**Mandatory logging prerequisite:** resource routes are not exempt from CPA request logging. Before enabling this role, set `observability.logs.request-log: false`. For the stock pinned server, also use `server.commercial-mode: true` and restart CPA: that omits its request-logging middleware, including error-only capture. This has a host-wide observability cost. Disable equivalent request/response body and authorization capture in every proxy, gateway, APM and log forwarder. See [why both settings matter](security.md#logging-is-a-deployment-requirement).
+**Mandatory logging prerequisite:** set `observability.logs.request-log: false` and `server.commercial-mode: true`, then restart CPA. The latter omits stock request-logging middleware, including error-only capture, at a host-wide observability cost. Disable body/authorization capture in every proxy, APM and log forwarder too. See [logging requirements](security.md#logging-is-a-deployment-requirement).
 
 ```yaml
 config-version: 8
@@ -48,22 +49,24 @@ plugins:
       priority: 100
       role: exporter
       secret_env: CPA_RELAY_BEARER
-      accounts: [acct-example-a]
-      source_files: [codex-login-a.json] # Optional; exact primary physical basename.
-      state_dir: /var/lib/example-relay/exporter
+      state_dir: /var/lib/example-relay/exporter-v2
 ```
 
-The authenticated endpoint is `GET /v0/resource/plugins/cpa-relay/snapshot`, on the existing primary HTTPS listener. Its only authentication is one `Authorization: Bearer <dedicated relay secret>` header. Do not use a CPA management key. Restrict network access to intended receivers as well.
+`GET /v0/resource/plugins/cpa-relay/snapshot` uses the existing primary HTTPS listener. It requires exactly one `Authorization: Bearer <dedicated relay secret>` header, not a CPA management key. Restrict network access to intended receivers.
 
-The exporter calls only `host.auth.list` and `host.auth.get`. It never saves, refreshes or deletes credentials. Optional `source_files` first filters the list by **exact, case-sensitive physical basename**, before any file read or identity parsing. Obtain the name through a secure local/admin workflow: in pinned stock CPA, the file watcher sets `Auth.FileName` to `filepath.Base(fullPath)`, but `host.auth.list` **trims** it for `Name` (`name` in JSON). Selection therefore also requires the unchanged host-reported physical `Path` (`path` in JSON): it must be absolute, clean and NUL-free, with `filepath.Base(Path)` exactly equal to the configured basename. No trimming or normalization is applied to make a path match; a missing/invalid/inconsistent path fails before `Get`. This rejects, for example, a physical leading-space filename whose trimmed `Name` aliases an absent pinned file. Do not use a display label, email, auth index, path or glob. Every configured source must appear exactly once as a physical Codex entry with an unambiguous nonempty auth index; a missing source, duplicate name or index alias fails the whole export with 503. No fallback login is chosen. Unselected files are not read, so malformed unrelated JSON/token fields cannot block this mode. Filenames remain on the exporter and are not included in the snapshot or public status.
+Every sync lists physical Codex records, reads their JSON using `host.auth.get`, then lists again. Runtime-only and known other-provider records are not exported or read. Duplicate paths/indexes, inconsistent list/get identities, malformed active credentials, failed callbacks or a changing inventory fail the **whole** export with 503. Unknown-provider physical entries also fail closed because they may be malformed Codex records. Nothing is truncated: limits are 128 discovered physical Codex sources (including disabled/expired ones), 4096 total host entries and a bounded 2 MiB response. Over a limit, repair/reduce the inventory; do not expect a partial snapshot.
 
-`accounts` is still mandatory. Every explicitly selected file must have an allowlisted account ID; a mismatch fails export. **The receiver supports one credential per workspace/account ID**, not several logins sharing that ID. Selecting two files with the same account ID still fails rather than choosing one arbitrarily. Omit `source_files` (or use `[]` on the exporter) to preserve account-only scanning and duplicate rejection.
+Only an access-token allowlist is projected: `credential_id`, `type`, `account_id`, `access_token`, `expired`, `disabled`, optional `email` and `plan_type`. No refresh/ID token, last-refresh, SIWC, proxy settings or arbitrary metadata is copied. Explicitly disabled Codex entries are omitted even with unusable token fields, provided their JSON and Codex type are valid. Well-formed expired tokens are omitted. Malformed active token/identity/expiry fields fail the whole export, rather than silently withdrawing an account. A valid empty/all-disabled inventory is authoritative, removes receiver credentials and cannot make it ready.
 
-After source selection, unknown source fields are discarded. Duplicate-free JSON structure and an unambiguous `account_id` are checked first; in account-only mode, clearly unselected identities are skipped before interpreting their token/optional fields. Ambiguous identity, read errors, duplicate selected IDs or malformed selected credentials fail the export as a whole. Expired selected accounts are omitted from a successful full snapshot; disabling a selected credential propagates withdrawal. With `source_files`, deleting/renaming a required file is an **error**, not an authoritative removal: the receiver retains its prior state only until its original deadline. To withdraw deliberately while retaining the source pin, disable that credential and keep its source file present. A successful empty/all-disabled snapshot cannot make a receiver ready.
+### Stable source identity and safe removal
+
+Protocol v2 identifies a credential by lowercase hex `SHA256("cpa-relay/codex-source/v2" || NUL || host physical Path)`; `NUL` is one zero byte. The exact, absolute, clean host-reported path is hashed without trimming/normalizing it. Stock CPA trims display `Name` and resolves Get by auth index; the adapter validates index/name/path responses and rejects aliases/duplicates. Basename whitespace inside a path remains distinct when the host can represent it consistently. The ID does not depend on access/refresh tokens, email, workspace or the runtime auth index. Tokens refreshed at the same path replace the same relay record; unchanged projections do not rewrite receiver files. **Rename/move is delete-and-add**, including changing the mounted auth-dir path. Two physical copies are two identities even if their contents match. No filename/path is sent on the wire or in public status. Hashes are pseudonymous identifiers, not protection against guessed paths.
+
+CPA can omit a malformed file entirely from its runtime list. The exporter therefore durably remembers paths from its last successful inventory in **private** state. Before treating a missing entry as deleted, it uses read-only filesystem metadata (`stat`/`lstat`, never direct credential reads) to prove the old file is absent and its parent still accessible. A still-present/unknown/inaccessible omitted source fails export, including across restarts. Repair it or physically delete it; do not erase state to bypass the guard. Conversion to another provider at the same path also requires a confirmed deletion first. This guard concerns previously discovered sources: an unlisted new malformed file has never been exported. Discovery still trusts CPA's host metadata, not an independent directory crawler or inode pinning against a local admin. Concurrent host/file changes are not a filesystem transaction; subsequent syncs converge.
 
 ## Receiver
 
-Use the **direct primary endpoint**, never the public failover hostname or the receiver itself. Reusing a failover hostname can loop the relay or change its trust authority. Do not put a broad primary management key on the receiver.
+Use the **direct primary endpoint**, never the public failover hostname or the receiver itself. That would risk loops or change trust authority. No primary management key belongs on the receiver.
 
 ```yaml
 config-version: 8
@@ -79,58 +82,60 @@ plugins:
       role: receiver
       endpoint: https://primary.example.invalid/v0/resource/plugins/cpa-relay/snapshot
       secret_env: CPA_RELAY_BEARER
-      accounts: [acct-example-a]
       auth_dir: /var/lib/example-cpa/auth
-      state_dir: /var/lib/example-relay/receiver
+      state_dir: /var/lib/example-relay/receiver-v2
       receiver_id: secondary
       poll_seconds: 15
       max_stale_seconds: 3600
       expiry_skew_seconds: 60
 ```
 
-`auth_dir` **must exactly match the resolved absolute `oauth.auth-dir` used by CPA**. The host does not expose that configuration to this plugin. Disabled staging saves check the returned host path before enabling credentials; a mismatch keeps readiness closed. Fix the setting rather than bypassing that check.
-
-Reserve `cpa-relay-<receiver_id>-<sha256(account_id)>.json` for this receiver. Never log in, add refresh material, enable SIWC, or manually replace normal credentials in this namespace. Existing files outside the durable ownership inventory are refused, not adopted or removed. Keep ordinary credentials in other files. Do not share this namespace across processes. A hidden namespace lock file also lives in auth-dir.
+`auth_dir` must exactly match CPA's resolved absolute `oauth.auth-dir`; disabled staging verifies the host's save path before enabling credentials. Reserve `cpa-relay-<receiver_id>-<sha256(credential_id)>.json`. Never log in, add renewal/SIWC material or manually replace files in this namespace. Existing files outside durable ownership are refused, not adopted/deleted. Keep unrelated credentials elsewhere; do not share the namespace across processes. A hidden auth-dir namespace lock is also used.
 
 ### Settings
 
-Settings are described by CPA `ConfigFields` and can be changed through its normal plugin settings UI. Invalid/missing settings retain the installed request gate in an unready state; they do not start a worker. Host-disabled, unloaded or fused plugins are different: CPA skips their gate, so external readiness enforcement is mandatory.
+CPA `ConfigFields` describes the settings UI. Invalid settings retain the installed gate unready with no worker. Host-disabled/unloaded/fused plugins are different: CPA skips their gate, so external ingress checks are mandatory.
 
 | Field | Requirement/default |
 | --- | --- |
 | `role` | Required: `exporter` or `receiver` |
-| `secret_env` | Required environment variable **name**, never its value |
-| `accounts` | Required unique array, 1–128 account IDs; letters/digits/underscore/hyphen, first character alphanumeric, maximum 128 characters each |
-| `source_files` | Exporter only, optional unique array of at most 128 exact basenames. Omitted/empty means account-only scanning. Each is 1–255 ASCII characters, first alphanumeric, remaining letters/digits/`.`/`_`/`@`/`+`/`-`, ending in `.json` (extension case may vary). No paths, whitespace, encoding, wildcards or normalization. Receiver must omit this field (even `[]` is rejected). |
+| `secret_env` | Required environment variable **name**, not its value |
 | `state_dir` | Required absolute private directory, not symlinked |
-| `endpoint` | Receiver only; exact HTTPS snapshot path, no user info, query or fragment |
-| `auth_dir` | Receiver only; absolute, exact CPA auth-dir |
+| `endpoint` | Receiver only; exact HTTPS snapshot path, no user info/query/fragment |
+| `auth_dir` | Receiver only; exact absolute CPA auth-dir |
 | `receiver_id` | Receiver only; stable 1–32 lowercase alphanumeric/hyphen characters, first alphanumeric |
 | `poll_seconds` | 15; range 1–300 |
 | `max_stale_seconds` | 3600; at least twice poll interval, at most 86400 |
 | `expiry_skew_seconds` | 60; range 5–600 |
 
-CPA also supplies its standard `enabled` and `priority` fields. Other settings are rejected. Source endpoint, role, auth-dir and receiver namespace are bound to the state file. To change that authority/namespace, stop the old role and verify cleanup, keep its private state for rollback, and provision a **new empty state directory**. Account/source-file selection and timing settings can change in place while preserving the replay watermark. Do not delete state to work around an error.
+CPA also supplies standard `enabled`/`priority`. Other settings are rejected. Source endpoint, role, auth-dir and receiver namespace are bound to state. To change them, cleanly drain the old role, preserve its state and use a new empty private state directory. Timing changes retain replay protection. Do not delete state to work around errors.
+
+## Migrate from v1 explicit selection
+
+This is an intentional protocol, state and authorization break, not an in-place auto-upgrade. Protocol/cache v1 and v1 ownership keys are rejected; there is no v1 fallback or adoption. **The old one-file receiver inventory must be drained by the old binary before replacement.** New naming cannot clean up that old ownership safely by inference.
+
+1. Keep the running installation unchanged until the maintenance window and explicit all-Codex authorization. Deny receiver ingress; prevent concurrent config updates. Back up both old binaries/configs/private state and the receiver's owned auth files with original ownership/modes in a restricted directory outside the repo. These backups contain bearer credentials.
+2. While the **old receiver binary is still enabled with working callbacks and its original config/state**, call authenticated `POST /v0/management/cpa-relay/drain`. Require HTTP 200 and `state: drained`. Verify readiness is non-200, old inventory `managed` is empty, and every formerly owned file is gone/runtime-disabled. A 503/timeout is **not** success; retain old state/binary and retry. Never just remove the state directory or disable first.
+3. Only after verified drain, stop CPA safely and retain a separate post-drain old-state copy for rollback. Back up/stop the exporter too. Replace both binaries together; mixed v1/v2 peers cannot sync. Preserve the old private directories unchanged.
+4. Explicitly remove the old `accounts` and `source_files` keys from **both** configs, including empty/null values. Their presence returns `settings_migration_required`; removing them is the operator's authorization to export all current and future Codex credentials. They no longer appear in the UI. Provision **new empty** mode-0700 v2 state directories on both roles. Keep the same auth-dir/receiver ID only after the old namespace is confirmed drained. Do not point the new binary at v1 cache or try editing its version/binding.
+5. Start the exporter, then receiver; require a newer authenticated live v2 snapshot, correct expected credential count, receiver readiness and registered models for every active record. Recheck logging and ingress fail-closed behavior. Only then admit traffic. Do not copy real snapshot bodies into logs/reports.
+6. Rollback: deny ingress and drain the **new** receiver successfully while its callbacks still work. Stop CPA; restore old binaries/configs and paired **post-drain** old state with original permissions. Restart exporter then receiver and require a newer live v1 snapshot/readiness before admitting traffic. A pre-drain backup has outstanding ownership obligations; never silently discard them. If a drain fails, keep ingress denied and the matching state/binary available for recovery.
 
 ## Status, control and ingress
 
-- Menu resource: `GET /v0/resource/plugins/cpa-relay/status` shows coarse readiness only. Reload to update; there is no secret/token input in this page.
-- Public probe: `GET /v0/resource/plugins/cpa-relay/ready` returns only `{"ready":true}` with HTTP 200, otherwise `{"ready":false}` with HTTP 503. No account IDs, endpoints or secrets are returned.
-- Local authenticated CPA management route: `GET /v0/management/cpa-relay/status` returns role, coarse state, count, original generation time and last-attempt code, never tokens or selectors.
-- Local authenticated management control: `POST /v0/management/cpa-relay/poll` coalesces a receiver poll request (202). It is not a successful-sync acknowledgement. Exporter, quarantined or terminated-worker use returns 409; a fully drained/unconfigured application returns 503.
-- Local authenticated lifecycle control: `POST /v0/management/cpa-relay/drain` closes admission, cancels/joins workers and synchronously disables/removes managed credentials. **Require HTTP 200 with `{"state":"drained"}` before disabling/unloading the plugin.** A 503 means cleanup is incomplete; keep ingress denied and retry. This is not a public resource. These management routes use existing CPA admin authentication; the receiver worker never uses that key.
+- Menu: `GET /v0/resource/plugins/cpa-relay/status` shows coarse readiness.
+- Public probe: `GET /v0/resource/plugins/cpa-relay/ready` returns only `{"ready":true}`/HTTP 200, otherwise false/503; no identifiers or secrets.
+- Authenticated local CPA management: `GET /v0/management/cpa-relay/status` gives role/coarse state/count/original generation/last-attempt code. `POST .../poll` coalesces a poll (202, not sync acknowledgement); exporter/quarantined/terminated-worker returns 409, drained/unconfigured returns 503.
+- Authenticated `POST /v0/management/cpa-relay/drain` closes admission, cancels/joins workers and disables/removes managed records. Require HTTP 200 with `{"state":"drained"}` **before** disable/unload/replacement. A 503 means retain ownership and retry. These controls use existing local admin authentication, never the export bearer.
 
-**Configure the failover ingress to deny receiver traffic unless the receiver probe returns HTTP 200. Missing routes, 404, 5xx, timeouts, TLS errors and unavailable health state must all deny traffic. Do not cache a successful probe indefinitely. Restrict direct listener access so clients cannot bypass ingress.** Active health polling has a detection interval; choose it deliberately. For stronger admission, use a per-request readiness decision and deny on any error. Verify the failure behavior with the plugin disabled and unloaded, not just with an expired snapshot.
+**Deny receiver traffic unless its probe returns 200. Missing routes, 404/5xx, errors, timeouts and missing health state must deny; prevent direct listener bypass.** Choose the health detection interval deliberately or use per-request checks. Test disabled/unloaded plugins, not just stale tokens. The plugin alone cannot enforce this boundary.
 
-The receiver starts closed on **every start/reconfigure**. It first synchronously disables/removes its old managed records, then requires a strictly newer live snapshot. Recoverable startup withdrawal errors retry with exponential backoff from one to fifteen seconds, with admission closed. Integrity quarantine cannot resume fetching or admission automatically: manual polls are rejected even if workers remain alive for runtime withdrawal retries. Poll requests are also rejected if the worker has terminated. A fresh cache is never sufficient to authorize startup. Restarting during a primary outage therefore blocks service even if the cache has unexpired access tokens. This is intentional.
+Every receiver start/reconfigure is closed: withdraw old owned records, then require a strictly newer live snapshot. Recoverable startup cleanup retries from one to fifteen seconds. Integrity quarantine cannot resume fetching/admission automatically. Cached tokens never authorize startup; restart during a primary outage intentionally blocks service.
 
-During normal operation a failed fetch or rejected replay retains the previous accepted state **only until its original deadline**. A valid newer snapshot is a full replacement; it may remove selected accounts. The deadline is the earliest of generation plus max-stale and each active token's explicit/JWT expiry minus skew. Admission also requires every active managed path to match an active, enabled, available Codex runtime record with at least one model registered through `host.auth.models`. Save acknowledgement or disk presence alone is insufficient. A one-second worker rechecks registration; observations expire after three seconds even if a callback stalls. Missing/error model observations keep the gate closed and retry without rewriting otherwise valid credentials. This is registration readiness, **not** proof of upstream inference, quota or every requested model. The public probe, authenticated status and request interceptor do not wait for disk or host callbacks. Background cleanup runs independently of slow HTTP fetches. No setting extends a cached generation's age.
+Failed fetch/invalid snapshot/replay retains the previous accepted state **only until its original deadline**; nothing extends it. A newer valid snapshot fully replaces membership. The deadline is the earliest of generation plus max-stale and every active explicit/JWT expiry minus skew. Admission also requires active/enabled/available runtime entries and registered models for **every** active managed path. Save acknowledgement/disk presence is not enough. A one-second worker audits files/models; model observations expire after three seconds even if callbacks stall. Missing model publication keeps the gate closed and retries without rewriting unchanged credentials. Registration is not proof of inference, quota or every requested model. Ready/status/interception do not wait for disk/callback locks; cleanup is independent of HTTP fetches.
 
 ## Drain before disable, unload, updates or rollback
 
-1. Deny receiver ingress and serialize configuration changes with this operation.
-2. While the plugin is still enabled and its host callbacks are available, POST to the authenticated `/v0/management/cpa-relay/drain` route. Require HTTP 200 and `state: drained`; also verify readiness is non-200 and managed runtime records/files are disabled/removed. Do not treat a timeout or 503 as success.
-3. Only after that handshake, disable/unload the plugin, replace it, or stop CPA. Drain does not disable the host plugin setting: its installed gate stays closed until reconfigured.
-4. For rollback, restore the backed-up plugin/config/private state together with original ownership/permissions, restart, and require a newer live snapshot before admitting traffic.
+Deny ingress, serialize configuration changes, then call authenticated drain while the plugin is enabled and callbacks work. Require 200/`drained`, non-200 readiness and removed/disabled owned files/runtime before disabling, unloading, replacing or stopping CPA. Drain keeps the installed gate closed until reconfiguration.
 
-A failed drain/quiesce retains its engine, ownership inventory and store locks; retrying drain performs the outstanding disable callbacks. Reconfigure cannot discard that obligation. **Stock CPA v8.0.63 closes callback availability before native shutdown on disable/unload**, so shutdown alone cannot guarantee acknowledged cleanup. Abrupt disable/fuse/crash must be contained by external ingress; old files or disabled tombstones may remain. A resident failed-cleanup library may retain ownership locks until the CPA process exits, so recovery can require a controlled full process restart, not merely re-enabling the plugin. Keep ingress denied, preserve private state, and inspect only the reserved namespace. Never remove unrelated auth files.
+Failed drain/quiesce retains engine, inventory and locks so retries perform real disable callbacks. **Stock CPA v8.0.63 closes callbacks before native shutdown on disable/unload**; shutdown alone cannot guarantee withdrawal. Abrupt disable/fuse/crash can leave files/tombstones and require a controlled full process restart to release resident-library locks. Keep ingress denied, preserve private state and inspect only the reserved namespace; never remove unrelated auth files.

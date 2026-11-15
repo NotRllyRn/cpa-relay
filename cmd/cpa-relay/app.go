@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -33,16 +34,42 @@ func (s hostSource) List() ([]relay.Entry, error) {
 	if err := s.call(pluginabi.MethodHostAuthList, struct{}{}, &out); err != nil {
 		return nil, err
 	}
+	if out.Files == nil {
+		return nil, relay.ErrExport
+	}
 	entries := make([]relay.Entry, 0, len(out.Files))
 	for _, f := range out.Files {
-		entries = append(entries, relay.Entry{Index: f.AuthIndex, Name: f.Name, Path: f.Path, Codex: f.Type == "codex" || f.Provider == "codex", RuntimeOnly: f.RuntimeOnly, Disabled: f.Disabled})
+		if (f.Type == "codex" && f.Provider != "" && f.Provider != "codex") || (f.Provider == "codex" && f.Type != "" && f.Type != "codex") {
+			return nil, relay.ErrExport
+		}
+		entries = append(entries, relay.Entry{Index: f.AuthIndex, Name: f.Name, Path: f.Path, Codex: f.Type == "codex" || f.Provider == "codex", RuntimeOnly: f.RuntimeOnly, Disabled: f.Disabled, UnknownProvider: (f.Type == "" || f.Type == "unknown") && (f.Provider == "" || f.Provider == "unknown")})
 	}
 	return entries, nil
 }
-func (s hostSource) Get(index string) ([]byte, error) {
+func (s hostSource) Removed(path string) (bool, error) {
+	// CPA can remove malformed files from its runtime listing. Only physical
+	// absence in an accessible parent proves deletion; no credential is read.
+	parent, err := os.Stat(filepath.Dir(path))
+	if err != nil || !parent.IsDir() {
+		return false, relay.ErrExport
+	}
+	_, err = os.Lstat(path)
+	if os.IsNotExist(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, relay.ErrExport
+	}
+	return false, nil
+}
+
+func (s hostSource) Get(entry relay.Entry) ([]byte, error) {
 	var out pluginapi.HostAuthGetResponse
-	err := s.call(pluginabi.MethodHostAuthGet, pluginapi.HostAuthGetRequest{AuthIndex: index}, &out)
-	return out.JSON, err
+	err := s.call(pluginabi.MethodHostAuthGet, pluginapi.HostAuthGetRequest{AuthIndex: entry.Index}, &out)
+	if err != nil || out.AuthIndex != entry.Index || out.Name != entry.Name || out.Path != entry.Path {
+		return nil, relay.ErrExport
+	}
+	return out.JSON, nil
 }
 
 func (s hostSource) Save(name string, raw []byte) (string, error) {
@@ -158,6 +185,9 @@ func (a *application) configure(raw []byte) {
 	}
 	c, secret, err := relay.ParseConfig(req.ConfigYAML)
 	if err != nil {
+		if err == relay.ErrLegacyConfig {
+			a.state.Store("settings_migration_required")
+		}
 		return
 	}
 	if !c.Enabled {
@@ -290,11 +320,9 @@ func (a *application) management(raw []byte) []byte {
 
 func metadata() any {
 	fields := []pluginapi.ConfigField{
-		{Name: "role", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"exporter", "receiver"}, Description: "Required role. Invalid settings keep the request gate closed."},
+		{Name: "role", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"exporter", "receiver"}, Description: "Required role. Exporter shares ALL current and future physical Codex credentials (maximum 128); no per-account selection. Invalid settings keep the gate closed."},
 		{Name: "endpoint", Type: pluginapi.ConfigFieldTypeString, Description: "Receiver: direct primary HTTPS snapshot URL, never a failover hostname. No query or user info."},
 		{Name: "secret_env", Type: pluginapi.ConfigFieldTypeString, Description: "Name of an environment variable containing 32+ random bytes encoded as unpadded base64url. Never put its value in settings."},
-		{Name: "accounts", Type: pluginapi.ConfigFieldTypeArray, Default: []string{}, Description: "Required explicit Codex account_id allowlist on both roles; maximum 128."},
-		{Name: "source_files", Type: pluginapi.ConfigFieldTypeArray, Description: "Exporter only: optional exact physical Codex .json basenames matching host.auth.list Name and raw Path basename, maximum 128. Omit on receiver. Accounts are still required; missing/ambiguous sources fail export."},
 		{Name: "poll_seconds", Type: pluginapi.ConfigFieldTypeInteger, Default: 15, Description: "Receiver polling interval, 1–300 seconds."},
 		{Name: "max_stale_seconds", Type: pluginapi.ConfigFieldTypeInteger, Default: 3600, Description: "Maximum original snapshot age; at least twice poll interval, at most 86400 seconds."},
 		{Name: "expiry_skew_seconds", Type: pluginapi.ConfigFieldTypeInteger, Default: 60, Description: "Withdraw before the earlier explicit/JWT expiry, 5–600 seconds."},
@@ -306,5 +334,5 @@ func metadata() any {
 		SchemaVersion uint32             `json:"schema_version"`
 		Metadata      pluginapi.Metadata `json:"metadata"`
 		Capabilities  map[string]bool    `json:"capabilities"`
-	}{pluginabi.SchemaVersion, pluginapi.Metadata{Name: "cpa-relay", Version: "0.1.0", Author: "NotRllyRn", GitHubRepository: "https://github.com/NotRllyRn/cpa-relay", ConfigFields: fields}, map[string]bool{"management_api": true, "request_interceptor": true, "request_interceptor_omit_body_before": true, "request_interceptor_omit_body_after": true}}
+	}{pluginabi.SchemaVersion, pluginapi.Metadata{Name: "cpa-relay", Version: "0.2.0", Author: "NotRllyRn", GitHubRepository: "https://github.com/NotRllyRn/cpa-relay", ConfigFields: fields}, map[string]bool{"management_api": true, "request_interceptor": true, "request_interceptor_omit_body_before": true, "request_interceptor_omit_body_after": true}}
 }

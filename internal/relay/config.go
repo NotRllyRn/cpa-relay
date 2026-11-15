@@ -12,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -24,29 +23,40 @@ const MaxBody = 2 << 20
 const MaxAccounts = 128
 
 var ErrConfig = errors.New("invalid relay settings")
+var ErrLegacyConfig = errors.New("accounts/source_files removed: drain old receiver and explicitly migrate to automatic Codex discovery with new private state")
 var idPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
 var envPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
-var sourceFilePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._@+-]{0,254}$`)
+var credentialPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 var ownerPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}$`)
 
 type Config struct {
-	Enabled           bool     `yaml:"enabled"`
-	Priority          int      `yaml:"priority"`
-	Role              string   `yaml:"role"`
-	Endpoint          string   `yaml:"endpoint"`
-	SecretEnv         string   `yaml:"secret_env"`
-	Accounts          []string `yaml:"accounts"`
-	SourceFiles       []string `yaml:"source_files"`
-	PollSeconds       int      `yaml:"poll_seconds"`
-	MaxStaleSeconds   int      `yaml:"max_stale_seconds"`
-	ExpirySkewSeconds int      `yaml:"expiry_skew_seconds"`
-	StateDir          string   `yaml:"state_dir"`
-	AuthDir           string   `yaml:"auth_dir"`
-	ReceiverID        string   `yaml:"receiver_id"`
+	Enabled           bool   `yaml:"enabled"`
+	Priority          int    `yaml:"priority"`
+	Role              string `yaml:"role"`
+	Endpoint          string `yaml:"endpoint"`
+	SecretEnv         string `yaml:"secret_env"`
+	PollSeconds       int    `yaml:"poll_seconds"`
+	MaxStaleSeconds   int    `yaml:"max_stale_seconds"`
+	ExpirySkewSeconds int    `yaml:"expiry_skew_seconds"`
+	StateDir          string `yaml:"state_dir"`
+	AuthDir           string `yaml:"auth_dir"`
+	ReceiverID        string `yaml:"receiver_id"`
 }
 
 func ParseConfig(raw []byte) (Config, string, error) {
 	c := Config{PollSeconds: 15, MaxStaleSeconds: 3600, ExpirySkewSeconds: 60}
+	var node yaml.Node
+	if yaml.Unmarshal(raw, &node) != nil {
+		return c, "", ErrConfig
+	}
+	if len(node.Content) == 1 && node.Content[0].Kind == yaml.MappingNode {
+		fields := node.Content[0].Content
+		for i := 0; i+1 < len(fields); i += 2 {
+			if fields[i].Value == "accounts" || fields[i].Value == "source_files" {
+				return c, "", ErrLegacyConfig
+			}
+		}
+	}
 	d := yaml.NewDecoder(bytes.NewReader(raw))
 	d.KnownFields(true)
 	if d.Decode(&c) != nil {
@@ -65,28 +75,6 @@ func ParseConfig(raw []byte) (Config, string, error) {
 	if c.PollSeconds < 1 || c.PollSeconds > 300 || c.MaxStaleSeconds < c.PollSeconds*2 || c.MaxStaleSeconds > 86400 || c.ExpirySkewSeconds < 5 || c.ExpirySkewSeconds > 600 {
 		return c, "", ErrConfig
 	}
-	if len(c.Accounts) == 0 || len(c.Accounts) > MaxAccounts {
-		return c, "", ErrConfig
-	}
-	seen := map[string]bool{}
-	for _, id := range c.Accounts {
-		if !idPattern.MatchString(id) || seen[id] {
-			return c, "", ErrConfig
-		}
-		seen[id] = true
-	}
-	sort.Strings(c.Accounts)
-	if len(c.SourceFiles) > MaxAccounts || (c.Role == "receiver" && c.SourceFiles != nil) {
-		return c, "", ErrConfig
-	}
-	seen = map[string]bool{}
-	for _, name := range c.SourceFiles {
-		if !sourceFilePattern.MatchString(name) || !strings.HasSuffix(strings.ToLower(name), ".json") || seen[name] {
-			return c, "", ErrConfig
-		}
-		seen[name] = true
-	}
-	sort.Strings(c.SourceFiles)
 	if c.Role == "receiver" {
 		u, e := url.Parse(c.Endpoint)
 		if e != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path != SnapshotPath || u.RawPath != "" || u.Opaque != "" || u.ForceQuery {
@@ -111,13 +99,8 @@ func within(path, dir string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-func (c Config) selected(id string) bool {
-	i := sort.SearchStrings(c.Accounts, id)
-	return i < len(c.Accounts) && c.Accounts[i] == id
-}
-
 // Binding prevents a cache/watermark from silently changing authority or namespace.
 func (c Config) binding() string {
-	sum := sha256.Sum256([]byte(strings.Join([]string{c.Role, c.Endpoint, c.AuthDir, c.ReceiverID}, "\x00")))
+	sum := sha256.Sum256([]byte(strings.Join([]string{"cpa-relay/state/v2", c.Role, c.Endpoint, c.AuthDir, c.ReceiverID}, "\x00")))
 	return hex.EncodeToString(sum[:])
 }
