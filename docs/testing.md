@@ -1,5 +1,11 @@
 # Checks and first integration test
 
+## Stock CPA smoke test
+
+On a Linux Docker host, run `make stock-smoke` for an opt-in test with two real CPA v8.0.63 containers, pinned by image digest. Docker and OpenSSL are required; Docker may download the image. The test uses a private internal Docker network with no external route and no published ports. The host must be able to reach its Docker bridge addresses.
+
+Only synthetic credentials are used. It verifies plugin loading, authenticated HTTPS export, sanitization, background host callbacks, same-file token replacement, runtime credential visibility, and authoritative removal/readiness. Containers and their private network are removed afterward. The printed private temporary directory retains synthetic fixtures and logs for inspection. This is not a real-provider inference or comprehensive log-audit test.
+
 ## Automated checks
 
 Run on Linux amd64 with Python 3, OpenSSL and a C compiler:

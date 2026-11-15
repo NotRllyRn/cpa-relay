@@ -4,7 +4,7 @@ export GOAMD64 := v1
 export CGO_ENABLED := 1
 export CGO_CFLAGS := -O2 -g -march=x86-64 -mtune=generic
 
-.PHONY: test race vet build abi check clean
+.PHONY: test race vet build abi stock-smoke check clean
 
 test:
 	go test ./...
@@ -21,6 +21,8 @@ build:
 	cp docs/licenses/* dist/docs/licenses/
 abi: build
 	python3 tests/abi_smoke.py dist/cpa-relay.so
+stock-smoke: build
+	python3 tests/stock_cpa_smoke.py
 check: test race vet abi
 clean:
 	rm -rf dist
