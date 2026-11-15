@@ -87,6 +87,7 @@ def main():
                       "refresh_token": "NEVER-RELAY", "id_token": "NEVER-RELAY", "metadata": {"secret": "NEVER-RELAY"}}
         lock = threading.Lock()
         buffers, runtime, calls, callback_errors = {}, {}, [], []
+        control = {"fail_disabled": 0, "disabled_attempts": 0, "models_missing": True}
         auth = root / "auth"
         auth.mkdir(mode=0o700)
         main_thread = threading.get_ident()
@@ -100,7 +101,16 @@ def main():
                 with lock:
                     calls.append((method, threading.get_ident()))
                 if method == "host.auth.list":
-                    result = {"files": [{"auth_index": "index-a", "type": "codex"}]}
+                    with lock:
+                        result = {"files": [{"auth_index": "index-a", "type": "codex"}] + [
+                            {"id": n, "name": n, "path": str(auth / n), "auth_index": "runtime-"+n,
+                             "provider": "codex", "status": "active", "disabled": a["disabled"]}
+                            for n, a in runtime.items()]}
+                elif method == "host.auth.models":
+                    with lock:
+                        result = {"credentials": [{"id": n, "auth_index": "runtime-"+n,
+                            "provider": "codex", "models": [] if a["disabled"] or control["models_missing"] else ["test-model"]}
+                            for n, a in runtime.items()]}
                 elif method == "host.auth.get":
                     result = {"json": credential}
                 elif method == "host.auth.save":
@@ -111,6 +121,11 @@ def main():
                     path.write_bytes(dumps(data))
                     os.chmod(path, 0o600)
                     with lock:
+                        if data["disabled"]:
+                            control["disabled_attempts"] += 1
+                            if control["fail_disabled"]:
+                                control["fail_disabled"] -= 1
+                                return 1  # intentional failure after the non-atomic disk write
                         runtime[name] = data
                     result = {"name": name, "path": str(path)}
                 else:
@@ -140,7 +155,7 @@ def main():
         assert lib.cliproxy_plugin_init(C.byref(host), C.byref(plugin)) == 0
         assert plugin.abi_version == 1
 
-        def rpc(method, payload):
+        def rpc(method, payload, okay=True):
             raw = dumps(payload)
             buf = C.create_string_buffer(raw)
             out = Buffer()
@@ -148,7 +163,7 @@ def main():
             try:
                 assert rc == 0 and out.ptr
                 envelope = json.loads(C.string_at(out.ptr, out.len))
-                assert envelope["ok"]
+                assert envelope["ok"] == okay
                 return envelope.get("result", {})
             finally:
                 if out.ptr:
@@ -175,7 +190,7 @@ def main():
         assert set(snapshot["accounts"][0]) == {"type", "account_id", "access_token", "expired", "disabled"}
         assert not any(method == "host.auth.save" for method, _ in calls)
         routes = rpc("management.register", {})
-        assert len(routes["resources"]) == 3 and len(routes["routes"]) == 2
+        assert len(routes["resources"]) == 3 and len(routes["routes"]) == 3
 
         serve = threading.Event()
         remote = {"status": 200, "body": body}
@@ -213,11 +228,41 @@ def main():
             assert gate["Terminate"] and gate["StatusCode"] == 503
             assert not ready()
             serve.set()
+            until(lambda: json.loads(management("/v0/management/cpa-relay/status")[1])["last_attempt"] == "models_pending")
+            assert not ready()  # save acknowledgement alone does not prove routes
+            assert rpc("request.intercept_before", {"Stream": True})["Terminate"]
+            with lock:
+                control["models_missing"] = False
             until(ready)
             assert not rpc("request.intercept_before", {"Stream": True})["Terminate"]
             with lock:
                 assert any(m == "host.auth.save" and ident != main_thread for m, ident in calls)
                 assert len(runtime) == 1 and not next(iter(runtime.values()))["disabled"]
+                assert any(m == "host.auth.models" and ident != main_thread for m, ident in calls)
+                control["fail_disabled"] = 3
+                before = control["disabled_attempts"]
+            rpc("plugin.quiesce", {}, okay=False)
+            assert not ready()
+            assert json.loads(management("/v0/management/cpa-relay/status")[1])["state"] == "cleanup_failed"
+            configure(config)  # must retry the retained engine, not replace it
+            assert not ready()
+            assert management("/v0/management/cpa-relay/drain", method="POST")[0] == 503
+            with lock:
+                assert control["disabled_attempts"] == before + 3
+                assert not next(iter(runtime.values()))["disabled"]
+            assert management("/v0/management/cpa-relay/drain", method="POST")[0] == 200
+            with lock:
+                assert control["disabled_attempts"] == before + 4
+                assert next(iter(runtime.values()))["disabled"]
+            assert not list(auth.glob("*.json"))
+            assert json.loads((root / "receiver/state.json").read_text())["managed"] == []
+            snapshot.update(generation=time.time_ns())
+            snapshot["generated_at"] = stamp(snapshot["generation"])
+            with lock:
+                remote["body"] = dumps(snapshot)
+            configure(config)
+            until(ready)
+            with lock:
                 remote["status"] = 500
             management("/v0/management/cpa-relay/poll", method="POST")
             until(lambda: json.loads(management("/v0/management/cpa-relay/status")[1])["last_attempt"] == "fetch_failed")
@@ -236,6 +281,8 @@ def main():
             for path in ("/v0/resource/plugins/cpa-relay/ready", "/v0/resource/plugins/cpa-relay/status", "/v0/management/cpa-relay/status"):
                 public = management(path)[1]
                 assert fake_token.encode() not in public and bearer.encode() not in public and b"acct-a" not in public
+            assert management("/v0/resource/plugins/cpa-relay/drain", method="POST")[0] == 404
+            assert management("/v0/management/cpa-relay/drain", method="POST")[0] == 200
             rpc("plugin.quiesce", {})
             assert not ready()
             plugin.shutdown()
@@ -247,7 +294,7 @@ def main():
             server.shutdown()
             server.server_close()
             server_thread.join(timeout=2)
-        print("PASS: native C ABI, export sanitization/auth, HTTPS pull, background save acknowledgements, gate, removal, replay, lifecycle, buffer ownership")
+        print("PASS: native C ABI, export sanitization/auth, HTTPS pull, background save/models, delayed routes, gate, removal, replay, failed quiesce/reconfigure retained cleanup, authenticated drain, lifecycle, buffer ownership")
 
 
 if __name__ == "__main__":

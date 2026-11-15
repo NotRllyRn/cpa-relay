@@ -135,6 +135,8 @@ func TestReconfigureStopsWorkerAndReadinessNeverWaitsForLocks(t *testing.T) {
 		if r.StatusCode != 503 {
 			t.Error("unready probe")
 		}
+		// Authenticated status is lock-free too, including during lifecycle work.
+		invoke(a, "GET", "/v0/management/cpa-relay/status", nil)
 		a.handle(pluginabi.MethodRequestInterceptBefore, nil)
 	}()
 	select {
@@ -169,7 +171,7 @@ func TestRoutesAndMetadataHaveNoSecretField(t *testing.T) {
 		Resources []pluginapi.ResourceRoute   `json:"resources"`
 	}
 	decodeResult(t, a.handle(pluginabi.MethodManagementRegister, nil), &routes)
-	if len(routes.Routes) != 2 || len(routes.Resources) != 3 {
+	if len(routes.Routes) != 3 || len(routes.Resources) != 3 {
 		t.Fatal("missing control/menu routes")
 	}
 	b := string(encoded(metadata()))

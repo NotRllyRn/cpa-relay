@@ -13,13 +13,16 @@ import (
 // mockHost models the important non-transactional CPA contract: a disk write
 // happens before runtime acknowledgement, and failed updates can leave bytes.
 type mockHost struct {
-	mu           sync.Mutex
-	dir          string
-	runtime      map[string]Account
-	failActive   bool
-	failDisabled bool
-	contaminate  bool
-	beforeActive func()
+	mu            sync.Mutex
+	dir           string
+	runtime       map[string]Account
+	failActive    bool
+	failDisabled  bool
+	contaminate   bool
+	beforeActive  func()
+	modelsMissing bool
+	modelsErr     bool
+	beforeModels  func()
 }
 
 func diskHost(dir string) *mockHost            { return &mockHost{dir: dir, runtime: map[string]Account{}} }
@@ -58,6 +61,30 @@ func (h *mockHost) Save(name string, raw []byte) (string, error) {
 	h.mu.Unlock()
 	return path, nil
 }
+func (h *mockHost) ModelsReady(paths []string) (bool, error) {
+	h.mu.Lock()
+	hook := h.beforeModels
+	h.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.modelsErr {
+		return false, ErrStorage
+	}
+	if h.modelsMissing || len(paths) == 0 {
+		return false, nil
+	}
+	for _, p := range paths {
+		a, ok := h.runtime[filepath.Base(p)]
+		if !ok || a.Disabled {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 func (h *mockHost) disabled(name string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()

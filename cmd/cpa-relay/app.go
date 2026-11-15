@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,7 +20,7 @@ type application struct {
 	engine  *relay.Engine
 	current atomic.Pointer[relay.Engine]
 	host    hostFunc
-	state   string
+	state   atomic.Value // immutable string; status must not wait for callbacks
 	fault   atomic.Bool
 }
 
@@ -49,6 +51,65 @@ func (s hostSource) Save(name string, raw []byte) (string, error) {
 	return out.Path, err
 }
 
+// ModelsReady joins the manager-backed runtime identity to its model registry
+// entry. A disk file, unrelated credential, or a disabled/error record is not
+// evidence of an available route. Model registration does not prove inference.
+func (s hostSource) ModelsReady(paths []string) (bool, error) {
+	var models pluginapi.HostAuthModelsResponse
+	if err := s.call(pluginabi.MethodHostAuthModels, pluginapi.HostAuthModelsRequest{}, &models); err != nil {
+		return false, err
+	}
+	var files struct {
+		Files []pluginapi.HostAuthFileEntry `json:"files"`
+	}
+	if err := s.call(pluginabi.MethodHostAuthList, struct{}{}, &files); err != nil {
+		return false, err
+	}
+	if len(paths) == 0 {
+		return false, nil
+	}
+	for _, path := range paths {
+		var found *pluginapi.HostAuthFileEntry
+		for i := range files.Files {
+			f := &files.Files[i]
+			if f.Path != path || f.Name != filepath.Base(path) {
+				continue
+			}
+			if found != nil {
+				return false, nil
+			}
+			found = f
+		}
+		f := found
+		if f == nil || f.ID == "" || f.AuthIndex == "" || f.Provider != "codex" || f.RuntimeOnly || f.Disabled || f.Unavailable || f.Status != "active" {
+			return false, nil
+		}
+		matched := 0
+		for _, m := range models.Credentials {
+			if m.AuthIndex != f.AuthIndex {
+				continue
+			}
+			matched++
+			if m.ID != f.ID || m.Provider != "codex" {
+				return false, nil
+			}
+			usable := false
+			for _, id := range m.Models {
+				if strings.TrimSpace(id) != "" {
+					usable = true
+				}
+			}
+			if !usable {
+				return false, nil
+			}
+		}
+		if matched != 1 {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 func success(v any) []byte {
 	r, _ := json.Marshal(v)
 	b, _ := json.Marshal(pluginabi.Envelope{OK: true, Result: r})
@@ -59,31 +120,34 @@ func failure() []byte {
 	return b
 }
 
-func (a *application) stop() {
+func (a *application) stop() error {
 	a.current.Store(nil)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.engine != nil {
-		_ = a.engine.Stop()
+		if err := a.engine.Stop(); err != nil {
+			a.state.Store("cleanup_failed")
+			return err
+		}
 		a.engine = nil
 	}
 	a.current.Store(nil)
-	a.state = "stopped"
+	a.state.Store("stopped")
+	return nil
 }
 
 func (a *application) configure(raw []byte) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.state = "settings_invalid"
+	a.state.Store("settings_invalid")
 	a.current.Store(nil)
 	// Stop old workers and withdraw their inventory before changing authority.
 	if a.engine != nil {
-		err := a.engine.Stop()
-		a.engine = nil
-		if err != nil {
-			a.state = "cleanup_failed"
+		if err := a.engine.Stop(); err != nil {
+			a.state.Store("cleanup_failed")
 			return
 		}
+		a.engine = nil
 	}
 	var req struct {
 		ConfigYAML    []byte `json:"config_yaml"`
@@ -97,17 +161,17 @@ func (a *application) configure(raw []byte) {
 		return
 	}
 	if !c.Enabled {
-		a.state = "disabled"
+		a.state.Store("disabled")
 		return
 	}
 	e, err := relay.New(c, secret, hostSource{a.host})
 	if err != nil {
-		a.state = "storage_unavailable"
+		a.state.Store("storage_unavailable")
 		return
 	}
 	a.engine = e
 	a.current.Store(e)
-	a.state = "configured"
+	a.state.Store("configured")
 	a.fault.Store(false)
 }
 
@@ -119,14 +183,16 @@ func (a *application) handle(method string, raw []byte) []byte {
 		// filesystem, URL, host error, or credential into the RPC error envelope.
 		return success(metadata())
 	case pluginabi.MethodPluginQuiesce, pluginabi.MethodPluginShutdown:
-		a.stop()
+		if a.stop() != nil {
+			return failure()
+		}
 		return success(struct{}{})
 	case pluginabi.MethodManagementRegister:
 		return success(struct {
 			Routes    []pluginapi.ManagementRoute `json:"routes"`
 			Resources []pluginapi.ResourceRoute   `json:"resources"`
 		}{
-			Routes:    []pluginapi.ManagementRoute{{Method: "GET", Path: "/cpa-relay/status"}, {Method: "POST", Path: "/cpa-relay/poll"}},
+			Routes:    []pluginapi.ManagementRoute{{Method: "GET", Path: "/cpa-relay/status"}, {Method: "POST", Path: "/cpa-relay/poll"}, {Method: "POST", Path: "/cpa-relay/drain"}},
 			Resources: []pluginapi.ResourceRoute{{Path: "/status", Menu: "CPA Relay", Description: "Coarse relay readiness; configure through CPA plugin settings."}, {Path: "/ready"}, {Path: "/snapshot"}},
 		})
 	case pluginabi.MethodRequestInterceptBefore, pluginabi.MethodRequestInterceptAfter:
@@ -170,7 +236,26 @@ func (a *application) management(raw []byte) []byte {
 		if ready {
 			label = "READY"
 		}
-		return response(200, "text/html; charset=utf-8", []byte(`<!doctype html><html lang="en"><meta charset="utf-8"><title>CPA Relay</title><h1>CPA Relay</h1><p>`+label+`</p><p>Reload to update. Use CPA plugin settings for role, endpoint and account selection. Authenticated controls: GET /v0/management/cpa-relay/status and POST /v0/management/cpa-relay/poll.</p><p>Ingress must fail closed unless /v0/resource/plugins/cpa-relay/ready returns HTTP 200. Do not expose a direct bypass.</p></html>`))
+		return response(200, "text/html; charset=utf-8", []byte(`<!doctype html><html lang="en"><meta charset="utf-8"><title>CPA Relay</title><h1>CPA Relay</h1><p>`+label+`</p><p>Reload to update. Use CPA plugin settings for role, endpoint and account selection. Authenticated controls: GET /v0/management/cpa-relay/status and POST /v0/management/cpa-relay/poll and /drain. Drain successfully before disabling or unloading.</p><p>Ingress must fail closed unless /v0/resource/plugins/cpa-relay/ready returns HTTP 200. Do not expose a direct bypass.</p></html>`))
+	}
+	// These paths are registered only with CPA's admin-authenticated management
+	// router. Never register drain as a public resource.
+	if req.Method == "POST" && req.Path == "/v0/management/cpa-relay/drain" {
+		if a.stop() != nil {
+			return jsonResponse(503, map[string]string{"state": "cleanup_failed"})
+		}
+		return jsonResponse(200, map[string]string{"state": "drained"})
+	}
+	if req.Method == "GET" && req.Path == "/v0/management/cpa-relay/status" {
+		e := a.current.Load()
+		if e == nil || a.fault.Load() {
+			state := "unconfigured"
+			if v := a.state.Load(); v != nil {
+				state = v.(string)
+			}
+			return jsonResponse(200, map[string]any{"ready": false, "state": state})
+		}
+		return jsonResponse(200, e.Status())
 	}
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -190,17 +275,12 @@ func (a *application) management(raw []byte) []byte {
 			return jsonResponse(503, map[string]string{"error": "unavailable"})
 		}
 		return response(200, "application/json", raw)
-	case req.Method == "GET" && req.Path == "/v0/management/cpa-relay/status":
-		if e == nil || a.fault.Load() {
-			return jsonResponse(200, map[string]any{"ready": false, "state": a.state})
-		}
-		return jsonResponse(200, e.Status())
 	case req.Method == "POST" && req.Path == "/v0/management/cpa-relay/poll":
 		if e == nil || a.fault.Load() {
 			return jsonResponse(503, map[string]string{"state": "unavailable"})
 		}
 		if !e.Trigger() {
-			return jsonResponse(409, map[string]string{"state": "not_receiver"})
+			return jsonResponse(409, map[string]string{"state": "poll_unavailable"})
 		}
 		return jsonResponse(202, map[string]string{"state": "poll_requested"})
 	default:

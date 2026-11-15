@@ -11,6 +11,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"path/filepath"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -29,6 +30,9 @@ type Source interface {
 }
 type Sink interface {
 	Save(name string, raw []byte) (string, error)
+	// ModelsReady confirms active runtime entries and registered models for every
+	// exact managed path, not upstream inference or quota health.
+	ModelsReady(paths []string) (bool, error)
 }
 
 type Entry struct {
@@ -59,9 +63,13 @@ type Engine struct {
 	done        chan struct{}
 	trigger     chan struct{}
 	stopped     bool
+	closed      bool
+	reconciled  bool
+	worker      atomic.Bool
+	status      atomic.Pointer[Status]
+	modelsUntil atomic.Int64
 	quarantined bool
 	withdrawn   bool
-	ready       bool
 	live        atomic.Bool
 	serving     atomic.Bool
 	deadline    atomic.Int64
@@ -82,6 +90,7 @@ func newEngine(c Config, secret string, source Source, suppliedTransport *http.T
 	}
 	e := &Engine{cfg: c, secret: secret, secretHash: sha256.Sum256([]byte("Bearer " + secret)), source: source, store: s, done: make(chan struct{}), trigger: make(chan struct{}, 1), lastAttempt: "starting"}
 	e.live.Store(true)
+	e.publishStatus()
 	if c.Role == "receiver" {
 		// Cached credentials never authorize startup. The worker first disables
 		// old runtime state, then requires a strictly newer live snapshot.
@@ -99,8 +108,10 @@ func newEngine(c Config, secret string, source Source, suppliedTransport *http.T
 		e.client = &http.Client{Transport: e.transport, Timeout: 10 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
 		ctx, cancel := context.WithCancel(context.Background())
 		e.cancel = cancel
+		e.worker.Store(true)
 		go func() {
 			defer close(e.done)
+			defer e.worker.Store(false)
 			reapDone := make(chan struct{})
 			go func() { defer close(reapDone); e.reap(ctx) }()
 			e.run(ctx)
@@ -128,6 +139,7 @@ func (e *Engine) recoverWorker() {
 		e.setReady(false)
 		e.quarantined = true
 		e.lastAttempt = "internal_error"
+		e.publishStatus()
 		e.mu.Unlock()
 	}
 }
@@ -148,6 +160,7 @@ func (e *Engine) reap(ctx context.Context) {
 func (e *Engine) initialize() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	defer e.publishStatus()
 	dirty := false
 	for _, id := range e.store.state.Managed {
 		if e.store.clean(id) != nil {
@@ -170,8 +183,33 @@ func (e *Engine) initialize() bool {
 func (e *Engine) run(ctx context.Context) {
 	defer e.recoverWorker()
 	// Instance host context only; panic unwinding must release every mutex.
-	if !e.initialize() {
-		return
+	backoff := time.Second
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		if e.initialize() {
+			break
+		}
+		e.mu.Lock()
+		quarantined := e.quarantined
+		e.mu.Unlock()
+		if quarantined {
+			return
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		if backoff < 15*time.Second {
+			backoff *= 2
+			if backoff > 15*time.Second {
+				backoff = 15 * time.Second
+			}
+		}
 	}
 	poll := time.NewTicker(time.Duration(e.cfg.PollSeconds) * time.Second)
 	defer poll.Stop()
@@ -189,7 +227,7 @@ func (e *Engine) run(ctx context.Context) {
 }
 
 func (e *Engine) Trigger() bool {
-	if !e.live.Load() || e.cfg.Role != "receiver" {
+	if !e.live.Load() || !e.worker.Load() || e.cfg.Role != "receiver" {
 		return false
 	}
 	select {
@@ -199,34 +237,34 @@ func (e *Engine) Trigger() bool {
 	return true
 }
 
+// Stop drains while callbacks remain available. Failed withdrawal retains both
+// the inventory and store locks; another Stop retries the cleanup obligation.
 func (e *Engine) Stop() error {
 	e.live.Store(false)
-	e.mu.Lock()
-	if e.stopped {
-		e.mu.Unlock()
-		<-e.done
-		return nil
-	}
-	e.stopped = true
-	e.live.Store(false)
-	e.setReady(false)
+	e.serving.Store(false)
 	if e.cancel != nil {
 		e.cancel()
 	}
-	e.mu.Unlock()
 	<-e.done
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	var err error
-	if e.cfg.Role == "receiver" {
-		err = e.store.withdrawRuntime(e.sink)
+	defer e.publishStatus()
+	e.stopped = true
+	e.setReady(false)
+	if e.closed {
+		return nil
 	}
 	if e.transport != nil {
 		e.transport.CloseIdleConnections()
 	}
+	if e.cfg.Role == "receiver" && e.store.withdrawRuntime(e.sink) != nil {
+		e.lastAttempt = "cleanup_failed"
+		return ErrStorage
+	}
 	e.store.close()
+	e.closed = true
 	e.secret = ""
-	return err
+	return nil
 }
 
 func (e *Engine) fresh(now time.Time) bool {
@@ -256,7 +294,7 @@ func (e *Engine) Ready() bool {
 		return true
 	}
 	now := time.Now().UnixNano()
-	return e.serving.Load() && now < e.deadline.Load() && now >= e.earliest.Load()
+	return e.serving.Load() && now < e.deadline.Load() && now >= e.earliest.Load() && now < e.modelsUntil.Load()
 }
 func (e *Engine) Gate() bool { return !e.live.Load() || (e.cfg.Role == "receiver" && !e.Ready()) }
 
@@ -264,7 +302,6 @@ func (e *Engine) Gate() bool { return !e.live.Load() || (e.cfg.Role == "receiver
 // every acknowledgement and integrity check. Deadline is conservative and
 // independently checked on every readiness/interception request.
 func (e *Engine) setReady(ready bool) {
-	e.ready = ready
 	if !ready {
 		e.serving.Store(false)
 		return
@@ -276,7 +313,6 @@ func (e *Engine) setReady(ready bool) {
 		}
 		exp, err := a.expires()
 		if err != nil {
-			e.ready = false
 			e.serving.Store(false)
 			return
 		}
@@ -290,23 +326,22 @@ func (e *Engine) setReady(ready bool) {
 	e.serving.Store(true)
 }
 
-func (e *Engine) Status() Status {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+// Must hold mu (except construction). Status never waits for native callbacks.
+func (e *Engine) publishStatus() {
 	s := Status{Role: e.cfg.Role, State: "starting", LastAttempt: e.lastAttempt}
 	if e.snapshot != nil {
 		t := e.snapshot.GeneratedAt
 		s.GeneratedAt = &t
 	}
 	switch {
+	case e.stopped && !e.closed:
+		s.State = "cleanup_failed"
 	case e.stopped:
 		s.State = "stopped"
 	case e.cfg.Role == "exporter":
 		s.State = "exporter"
-		s.Ready = true
-	case e.ready && e.fresh(time.Now()):
+	case e.Ready():
 		s.State = "ready"
-		s.Ready = true
 		for _, a := range e.snapshot.Accounts {
 			if !a.Disabled {
 				s.Accounts++
@@ -317,22 +352,62 @@ func (e *Engine) Status() Status {
 	case e.snapshot != nil:
 		s.State = "unready"
 	}
+	e.status.Store(&s)
+}
+
+func (e *Engine) Status() Status {
+	s := *e.status.Load()
+	s.Ready = e.Ready()
+	if s.State == "ready" && !s.Ready {
+		s.State = "unready"
+	}
 	return s
+}
+
+// The observation lease expires even if a native callback blocks. Native calls
+// are joined, not detached beyond the lifetime of the host context.
+func (e *Engine) checkModels() {
+	start := time.Now()
+	paths := []string{}
+	for _, a := range e.snapshot.Accounts {
+		if !a.Disabled {
+			paths = append(paths, filepath.Join(e.cfg.AuthDir, e.store.filename(a.AccountID)))
+		}
+	}
+	okay, err := e.sink.ModelsReady(paths)
+	until := start.Add(3 * time.Second)
+	if err != nil || !okay || len(paths) == 0 || !time.Now().Before(until) || !e.fresh(time.Now()) {
+		e.setReady(false)
+		if err != nil {
+			e.lastAttempt = "models_failed"
+		} else {
+			e.lastAttempt = "models_pending"
+		}
+		return
+	}
+	e.modelsUntil.Store(until.UnixNano())
+	e.setReady(true)
+	if e.lastAttempt == "models_failed" || e.lastAttempt == "models_pending" {
+		e.lastAttempt = "ok"
+	}
 }
 
 func (e *Engine) expire(now time.Time) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	defer e.publishStatus()
 	if e.stopped {
 		return
 	}
-	if e.ready && e.fresh(now) {
+	if e.reconciled && e.fresh(now) {
 		if e.store.audit(e.snapshot) == nil {
+			e.checkModels()
 			return
 		}
 		e.quarantined = true
 		e.lastAttempt = "integrity_failed"
 	}
+	e.reconciled = false
 	e.setReady(false)
 	if e.withdrawn {
 		return
@@ -375,7 +450,8 @@ func (e *Engine) pull(ctx context.Context) {
 	snap, err := fetch(ctx, e.client, e.cfg.Endpoint, e.secret, e.cfg)
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.stopped || e.quarantined || ctx.Err() != nil {
+	defer e.publishStatus()
+	if !e.live.Load() || e.stopped || e.quarantined || ctx.Err() != nil {
 		return
 	}
 	if err != nil {
@@ -387,6 +463,7 @@ func (e *Engine) pull(ctx context.Context) {
 		return
 	}
 	// Validation is all-or-nothing. Failed fetches never apply removals.
+	e.reconciled = false
 	e.setReady(false)
 	e.withdrawn = false
 	if e.store.accept(snap) != nil {
@@ -406,7 +483,8 @@ func (e *Engine) pull(ctx context.Context) {
 		return
 	}
 	e.lastAttempt = "ok"
-	e.setReady(e.fresh(time.Now()))
+	e.reconciled = true
+	e.checkModels()
 }
 
 func (e *Engine) Export(now time.Time) ([]byte, error) {
@@ -433,12 +511,16 @@ func (e *Engine) Export(now time.Time) ([]byte, error) {
 		if err != nil {
 			return nil, ErrExport
 		}
-		a, err := Sanitize(raw)
+		id, err := SourceIdentity(raw)
 		if err != nil {
 			return nil, ErrExport
 		}
-		if !e.cfg.selected(a.AccountID) {
+		if !e.cfg.selected(id) {
 			continue
+		}
+		a, err := Sanitize(raw)
+		if err != nil {
+			return nil, ErrExport
 		}
 		if seen[a.AccountID] {
 			return nil, ErrExport

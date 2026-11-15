@@ -179,24 +179,53 @@ func (a Account) expires() (time.Time, error) {
 	return explicit, nil
 }
 
+// SourceIdentity validates structure and identity before interpreting unrelated
+// token/optional fields. Missing, invalid or ambiguous identities fail closed.
+func SourceIdentity(raw []byte) (string, error) {
+	m, err := sourceObject(raw)
+	if err != nil {
+		return "", err
+	}
+	var id string
+	if json.Unmarshal(m["account_id"], &id) != nil || !idPattern.MatchString(id) {
+		return "", ErrSnapshot
+	}
+	return id, nil
+}
+
+func sourceObject(raw []byte) (map[string]json.RawMessage, error) {
+	if len(raw) > MaxBody || !json.Valid(raw) {
+		return nil, ErrSnapshot
+	}
+	d := json.NewDecoder(bytes.NewReader(raw))
+	if walkJSON(d) != nil {
+		return nil, ErrSnapshot
+	}
+	var m map[string]json.RawMessage
+	if json.Unmarshal(raw, &m) != nil || m == nil {
+		return nil, ErrSnapshot
+	}
+	// Case aliases are not distinct credential identities, even though ordinary
+	// map decoding would allow them alongside account_id.
+	for key := range m {
+		if strings.EqualFold(key, "account_id") && key != "account_id" {
+			return nil, ErrSnapshot
+		}
+	}
+	return m, nil
+}
+
 // Sanitize reads only top-level allowed fields from the physical CPA credential.
 // Unknown source metadata is discarded, never copied into the protocol or cache.
 func Sanitize(raw []byte) (Account, error) {
 	var a Account
-	if len(raw) > MaxBody || !json.Valid(raw) {
-		return a, ErrSnapshot
-	}
-	d := json.NewDecoder(bytes.NewReader(raw))
-	if walkJSON(d) != nil {
-		return a, ErrSnapshot
-	}
-	var m map[string]json.RawMessage
-	if json.Unmarshal(raw, &m) != nil {
-		return a, ErrSnapshot
+	m, err := sourceObject(raw)
+	if err != nil {
+		return a, err
 	}
 	for key, dst := range map[string]any{"type": &a.Type, "access_token": &a.AccessToken, "account_id": &a.AccountID, "expired": &a.Expired, "email": &a.Email, "plan_type": &a.PlanType, "disabled": &a.Disabled} {
 		if v, ok := m[key]; ok {
-			if json.Unmarshal(v, dst) != nil {
+			if bytes.Equal(bytes.TrimSpace(v), []byte("null")) || json.Unmarshal(v, dst) != nil {
 				return Account{}, ErrSnapshot
 			}
 		}
