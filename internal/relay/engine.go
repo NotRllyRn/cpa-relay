@@ -36,7 +36,7 @@ type Sink interface {
 }
 
 type Entry struct {
-	Index, Name                  string
+	Index, Name, Path            string
 	Codex, RuntimeOnly, Disabled bool
 }
 

@@ -80,13 +80,15 @@ func TestExporterBridgeReadOnlyAndSecretFreeUI(t *testing.T) {
 	now := time.Now()
 	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, now.Add(time.Hour).Unix())))
 	credential := map[string]any{"type": "codex", "account_id": "acct-a", "access_token": "e30." + payload + ".sig", "expired": now.Add(time.Hour).UTC().Format(time.RFC3339), "refresh_token": "DO-NOT-LEAK", "id_token": "DO-NOT-LEAK", "metadata": map[string]any{"secret": "DO-NOT-LEAK"}}
+	physicalPath := "/example/auth/chosen.json"
 	a := &application{host: func(method string, request any, dst any) error {
 		mu.Lock()
 		methods = append(methods, method)
+		path := physicalPath
 		mu.Unlock()
 		switch method {
 		case pluginabi.MethodHostAuthList:
-			json.Unmarshal(encoded(map[string]any{"files": []any{pluginapi.HostAuthFileEntry{AuthIndex: "index", Name: "chosen.json", Type: "codex"}, pluginapi.HostAuthFileEntry{AuthIndex: "other", Name: "other.json", Type: "codex"}}}), dst)
+			json.Unmarshal(encoded(map[string]any{"files": []any{pluginapi.HostAuthFileEntry{AuthIndex: "index", Name: "chosen.json", Path: path, Type: "codex"}, pluginapi.HostAuthFileEntry{AuthIndex: "other", Name: "other.json", Path: "/example/auth/other.json", Type: "codex"}}}), dst)
 		case pluginabi.MethodHostAuthGet:
 			if request.(pluginapi.HostAuthGetRequest).AuthIndex != "index" {
 				return errors.New("unselected source read")
@@ -116,12 +118,28 @@ func TestExporterBridgeReadOnlyAndSecretFreeUI(t *testing.T) {
 			t.Fatal("UI/status leak")
 		}
 	}
+	// Stock Name trims whitespace from the physical filename. Without the
+	// intended file, a same-workspace alias must fail before any Get.
+	mu.Lock()
+	physicalPath = "/example/auth/ chosen.json"
+	mu.Unlock()
+	decodeResult(t, invoke(a, "GET", relay.SnapshotPath, http.Header{"Authorization": {"Bearer " + secret}}), &response)
+	if response.StatusCode != 503 {
+		t.Fatal("trimmed physical filename alias exported")
+	}
 	mu.Lock()
 	defer mu.Unlock()
+	gets := 0
 	for _, method := range methods {
+		if method == pluginabi.MethodHostAuthGet {
+			gets++
+		}
 		if method == pluginabi.MethodHostAuthSave {
 			t.Fatal("exporter wrote credentials")
 		}
+	}
+	if gets != 1 {
+		t.Fatal("physical filename alias was read")
 	}
 }
 

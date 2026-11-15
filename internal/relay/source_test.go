@@ -34,7 +34,7 @@ func TestSourceFilesDisambiguateSharedWorkspace(t *testing.T) {
 			a, b := account(now, "acct-a"), account(now, "acct-a")
 			a.Email, b.Email = "chosen@example.invalid", "other@example.invalid"
 			src := &trackedSource{fakeSource: fakeSource{
-				entries: []Entry{{Index: "a", Name: "chosen.json", Codex: true}, {Index: "b", Name: "other.json", Codex: true}},
+				entries: []Entry{{Index: "a", Name: "chosen.json", Path: "/example/auth/chosen.json", Codex: true}, {Index: "b", Name: "other.json", Path: "/example/auth/other.json", Codex: true}},
 				raw:     map[string][]byte{"a": marshal(t, a), "b": marshal(t, b)},
 			}}
 			c := diskConfig(t, "exporter")
@@ -64,7 +64,7 @@ func TestSourceFilesDisambiguateSharedWorkspace(t *testing.T) {
 }
 
 func TestSourceFilesPreflightAndFiltering(t *testing.T) {
-	chosen := Entry{Index: "a", Name: "chosen.json", Codex: true}
+	chosen := Entry{Index: "a", Name: "chosen.json", Path: "/example/auth/chosen.json", Codex: true}
 	for _, tc := range []struct {
 		name    string
 		files   []string
@@ -76,19 +76,20 @@ func TestSourceFilesPreflightAndFiltering(t *testing.T) {
 		{"malformed unrelated JSON", []string{"chosen.json"}, []Entry{{Index: "bad-json", Name: "unrelated.json", Codex: true}, chosen}, []string{"a"}, true},
 		{"malformed unrelated fields", []string{"chosen.json"}, []Entry{{Index: "bad-fields", Name: "unrelated.json", Codex: true}, chosen}, []string{"a"}, true},
 		{"missing selected source", []string{"chosen.json", "missing.json"}, []Entry{chosen}, nil, false},
-		{"duplicate name", []string{"chosen.json"}, []Entry{chosen, {Index: "b", Name: "chosen.json", Codex: true}}, nil, false},
+		{"duplicate name", []string{"chosen.json"}, []Entry{chosen, {Index: "b", Name: "chosen.json", Path: "/example/other-auth/chosen.json", Codex: true}}, nil, false},
 		{"duplicate name on another provider", []string{"chosen.json"}, []Entry{chosen, {Index: "b", Name: "chosen.json"}}, nil, false},
 		{"unselected index alias", []string{"chosen.json"}, []Entry{chosen, {Index: "a", Name: "other.json", Codex: true}}, nil, false},
-		{"selected index alias", []string{"chosen.json", "other.json"}, []Entry{chosen, {Index: "a", Name: "other.json", Codex: true}}, nil, false},
-		{"runtime only", []string{"chosen.json"}, []Entry{{Index: "a", Name: "chosen.json", Codex: true, RuntimeOnly: true}}, nil, false},
-		{"wrong provider", []string{"chosen.json"}, []Entry{{Index: "a", Name: "chosen.json"}}, nil, false},
-		{"empty index", []string{"chosen.json"}, []Entry{{Name: "chosen.json", Codex: true}}, nil, false},
-		{"trimmed index alias", []string{"chosen.json"}, []Entry{{Index: " a ", Name: "chosen.json", Codex: true}}, nil, false},
+		{"selected index alias", []string{"chosen.json", "other.json"}, []Entry{chosen, {Index: "a", Name: "other.json", Path: "/example/auth/other.json", Codex: true}}, nil, false},
+		{"ambiguous trimmed physical name", []string{"chosen.json"}, []Entry{chosen, {Index: "b", Name: "chosen.json", Path: "/example/auth/ chosen.json", Codex: true}}, nil, false},
+		{"runtime only", []string{"chosen.json"}, []Entry{{Index: "a", Name: "chosen.json", Path: "/example/auth/chosen.json", Codex: true, RuntimeOnly: true}}, nil, false},
+		{"wrong provider", []string{"chosen.json"}, []Entry{{Index: "a", Name: "chosen.json", Path: "/example/auth/chosen.json"}}, nil, false},
+		{"empty index", []string{"chosen.json"}, []Entry{{Name: "chosen.json", Path: "/example/auth/chosen.json", Codex: true}}, nil, false},
+		{"trimmed index alias", []string{"chosen.json"}, []Entry{{Index: " a ", Name: "chosen.json", Path: "/example/auth/chosen.json", Codex: true}}, nil, false},
 		{"name is not a basename", []string{"chosen.json"}, []Entry{{Index: "a", Name: "../chosen.json", Codex: true}}, nil, false},
 		{"no path normalization", []string{"chosen.json"}, []Entry{{Index: "a", Name: "./chosen.json", Codex: true}}, nil, false},
 		{"case sensitive", []string{"chosen.json"}, []Entry{{Index: "a", Name: "Chosen.json", Codex: true}}, nil, false},
-		{"account allowlist still required", []string{"other.json"}, []Entry{{Index: "b", Name: "other.json", Codex: true}}, []string{"b"}, false},
-		{"selected malformed fields", []string{"chosen.json"}, []Entry{{Index: "bad-fields", Name: "chosen.json", Codex: true}}, []string{"bad-fields"}, false},
+		{"account allowlist still required", []string{"other.json"}, []Entry{{Index: "b", Name: "other.json", Path: "/example/auth/other.json", Codex: true}}, []string{"b"}, false},
+		{"selected malformed fields", []string{"chosen.json"}, []Entry{{Index: "bad-fields", Name: "chosen.json", Path: "/example/auth/chosen.json", Codex: true}}, []string{"bad-fields"}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			now := time.Now()
@@ -106,6 +107,34 @@ func TestSourceFilesPreflightAndFiltering(t *testing.T) {
 			_, err = e.Export(now)
 			if (err == nil) != tc.ok || !reflect.DeepEqual(src.gets, tc.gets) {
 				t.Fatalf("success=%v reads=%v", err == nil, src.gets)
+			}
+		})
+	}
+}
+
+func TestSourceFilesRejectPhysicalPathAliases(t *testing.T) {
+	for _, path := range []string{
+		"/example/auth/ chosen.json", // Stock Name trims this to chosen.json; the intended file is absent.
+		"/example/auth/chosen.json ", "/example/auth/other.json", "/example/auth/Chosen.json",
+		"", "chosen.json", "auth/chosen.json", " /example/auth/chosen.json",
+		"/example/auth/chosen.json/", "/example/auth/./chosen.json", "/example/auth/other/../chosen.json",
+		"/example//auth/chosen.json", "/example/auth/\x00/chosen.json",
+	} {
+		t.Run(path, func(t *testing.T) {
+			now := time.Now()
+			src := &trackedSource{fakeSource: fakeSource{
+				entries: []Entry{{Index: "a", Name: "chosen.json", Path: path, Codex: true}},
+				raw:     map[string][]byte{"a": marshal(t, account(now, "acct-a"))},
+			}}
+			c := diskConfig(t, "exporter")
+			c.SourceFiles = []string{"chosen.json"}
+			e, err := New(c, secret(), src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer e.Stop()
+			if _, err := e.Export(now); err != ErrExport || len(src.gets) != 0 {
+				t.Fatal("invalid physical path was read or exported")
 			}
 		})
 	}

@@ -87,7 +87,8 @@ def main():
                       "refresh_token": "NEVER-RELAY", "id_token": "NEVER-RELAY", "metadata": {"secret": "NEVER-RELAY"}}
         lock = threading.Lock()
         buffers, runtime, calls, callback_errors = {}, {}, [], []
-        control = {"fail_disabled": 0, "disabled_attempts": 0, "models_missing": True}
+        control = {"fail_disabled": 0, "disabled_attempts": 0, "models_missing": True,
+                   "source_path": str(root / "source" / "chosen.json")}
         auth = root / "auth"
         auth.mkdir(mode=0o700)
         main_thread = threading.get_ident()
@@ -102,7 +103,8 @@ def main():
                     calls.append((method, threading.get_ident()))
                 if method == "host.auth.list":
                     with lock:
-                        result = {"files": [{"auth_index": "index-a", "type": "codex"}] + [
+                        result = {"files": [{"auth_index": "index-a", "type": "codex", "name": "chosen.json",
+                                              "path": control["source_path"]}] + [
                             {"id": n, "name": n, "path": str(auth / n), "auth_index": "runtime-"+n,
                              "provider": "codex", "status": "active", "disabled": a["disabled"]}
                             for n, a in runtime.items()]}
@@ -182,13 +184,21 @@ def main():
             return management("/v0/resource/plugins/cpa-relay/ready")[0] == 200
 
         common = {"enabled": True, "secret_env": "CPA_RELAY_ABI_SECRET", "accounts": ["acct-a"], "poll_seconds": 15}
-        configure(dict(common, role="exporter", state_dir=str(root / "exporter")), "plugin.register")
+        configure(dict(common, role="exporter", state_dir=str(root / "exporter"), source_files=["chosen.json"]), "plugin.register")
         assert management("/v0/resource/plugins/cpa-relay/snapshot")[0] == 401
         status, body = management("/v0/resource/plugins/cpa-relay/snapshot", {"Authorization": ["Bearer " + bearer]})
         assert status == 200 and b"NEVER-RELAY" not in body, (status, management("/v0/management/cpa-relay/status")[1], callback_errors)
         snapshot = json.loads(body)
         assert set(snapshot["accounts"][0]) == {"type", "account_id", "access_token", "expired", "disabled"}
         assert not any(method == "host.auth.save" for method, _ in calls)
+        assert b"chosen.json" not in body and b"/source/" not in body
+        with lock:
+            gets = sum(method == "host.auth.get" for method, _ in calls)
+            control["source_path"] = str(root / "source" / " chosen.json")
+        assert management("/v0/resource/plugins/cpa-relay/snapshot", {"Authorization": ["Bearer " + bearer]})[0] == 503
+        with lock:
+            assert sum(method == "host.auth.get" for method, _ in calls) == gets
+            control["source_path"] = str(root / "source" / "chosen.json")
         routes = rpc("management.register", {})
         assert len(routes["resources"]) == 3 and len(routes["routes"]) == 3
 

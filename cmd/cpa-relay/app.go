@@ -35,7 +35,7 @@ func (s hostSource) List() ([]relay.Entry, error) {
 	}
 	entries := make([]relay.Entry, 0, len(out.Files))
 	for _, f := range out.Files {
-		entries = append(entries, relay.Entry{Index: f.AuthIndex, Name: f.Name, Codex: f.Type == "codex" || f.Provider == "codex", RuntimeOnly: f.RuntimeOnly, Disabled: f.Disabled})
+		entries = append(entries, relay.Entry{Index: f.AuthIndex, Name: f.Name, Path: f.Path, Codex: f.Type == "codex" || f.Provider == "codex", RuntimeOnly: f.RuntimeOnly, Disabled: f.Disabled})
 	}
 	return entries, nil
 }
@@ -294,7 +294,7 @@ func metadata() any {
 		{Name: "endpoint", Type: pluginapi.ConfigFieldTypeString, Description: "Receiver: direct primary HTTPS snapshot URL, never a failover hostname. No query or user info."},
 		{Name: "secret_env", Type: pluginapi.ConfigFieldTypeString, Description: "Name of an environment variable containing 32+ random bytes encoded as unpadded base64url. Never put its value in settings."},
 		{Name: "accounts", Type: pluginapi.ConfigFieldTypeArray, Default: []string{}, Description: "Required explicit Codex account_id allowlist on both roles; maximum 128."},
-		{Name: "source_files", Type: pluginapi.ConfigFieldTypeArray, Description: "Exporter only: optional exact physical Codex .json basenames from host.auth.list Name, maximum 128. Omit on receiver. Accounts are still required; missing/ambiguous sources fail export."},
+		{Name: "source_files", Type: pluginapi.ConfigFieldTypeArray, Description: "Exporter only: optional exact physical Codex .json basenames matching host.auth.list Name and raw Path basename, maximum 128. Omit on receiver. Accounts are still required; missing/ambiguous sources fail export."},
 		{Name: "poll_seconds", Type: pluginapi.ConfigFieldTypeInteger, Default: 15, Description: "Receiver polling interval, 1–300 seconds."},
 		{Name: "max_stale_seconds", Type: pluginapi.ConfigFieldTypeInteger, Default: 3600, Description: "Maximum original snapshot age; at least twice poll interval, at most 86400 seconds."},
 		{Name: "expiry_skew_seconds", Type: pluginapi.ConfigFieldTypeInteger, Default: 60, Description: "Withdraw before the earlier explicit/JWT expiry, 5–600 seconds."},

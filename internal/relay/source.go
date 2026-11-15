@@ -1,6 +1,9 @@
 package relay
 
-import "strings"
+import (
+	"path/filepath"
+	"strings"
+)
 
 // selectSources resolves exact host-reported physical basenames before any Get.
 // Name and index ambiguity fail closed, including an unselected index alias:
@@ -21,6 +24,11 @@ func selectSources(entries []Entry, names []string) ([]Entry, error) {
 			continue
 		}
 		if _, exists := selected[entry.Name]; exists || !entry.Codex || entry.RuntimeOnly || entry.Index == "" || strings.TrimSpace(entry.Index) != entry.Index {
+			return nil, ErrExport
+		}
+		// Stock CPA trims Name, so Name alone can alias another physical file.
+		// Preserve the raw path and reject rather than normalize it before Get.
+		if !filepath.IsAbs(entry.Path) || filepath.Clean(entry.Path) != entry.Path || strings.ContainsRune(entry.Path, 0) || filepath.Base(entry.Path) != entry.Name {
 			return nil, ErrExport
 		}
 		selected[entry.Name] = entry

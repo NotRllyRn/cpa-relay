@@ -83,7 +83,7 @@ try:
  code,snap=call('exporter','/v0/resource/plugins/cpa-relay/snapshot',secret)
  assert code==200 and 'REFRESH_CANARY' not in json.dumps(snap) and 'ID_CANARY' not in json.dumps(snap)
  assert len(snap['accounts'])==1 and snap['accounts'][0]['email']=='test@example.invalid'
- assert all(value not in json.dumps(snap) for value in ('source.json','other.json','other@example.invalid'))
+ assert all(value not in json.dumps(snap) for value in ('source.json','other.json','other@example.invalid','/fixture/auth/'))
  print('PASS: exact physical filename selects one of two logins sharing a workspace without relaying filenames')
  assert call('exporter','/v0/resource/plugins/cpa-relay/snapshot')[0]==401
  print('PASS: exporter authentication and projection')
@@ -125,6 +125,14 @@ try:
  assert json.loads((root/'receiver/state/state.json').read_text())['managed'], 'abrupt disable unexpectedly acknowledged cleanup'
  assert files[0].exists(), 'abrupt disable incorrectly reported physical cleanup'
  print('PASS: stock abrupt disable retains unacknowledged cleanup; no plugin-only shutdown guarantee')
+ # Cold-start with only the alias so a live remove/create cannot coalesce away
+ # the misleading metadata. Receiver lifecycle/model tests are complete above.
+ source.unlink()
+ alias=source.with_name(' source.json');alias_data=credential(901);alias_data['email']='alias@example.invalid';alias.write_text(json.dumps(alias_data))
+ run('docker','restart',name+'-exporter')
+ wait(lambda:any(f.get('path')=='/fixture/auth/ source.json' and f.get('name')=='source.json' for f in call('exporter','/v0/management/auth-files',admin)[1]['files']),'stock host observes leading-space physical alias under trimmed selected Name')
+ assert call('exporter','/v0/resource/plugins/cpa-relay/snapshot',secret)[0]==503, 'trimmed source Name exported a different physical login'
+ print('PASS: missing pinned physical file rejects trimmed-Name alias instead of exporting another login')
  for role in ('exporter','receiver'):
   logs=run('docker','logs',name+'-'+role)
   assert 'REFRESH_CANARY' not in logs and 'ID_CANARY' not in logs
