@@ -310,12 +310,25 @@ def main():
             with lock:
                 remote["body"] = dumps(snapshot)
             configure(config)
+            assert not ready() and not list(auth.glob("*.json"))  # Explicit drain survives same-config reload.
+            configure(config, "plugin.register")  # Deliberate new registration requires a newer live snapshot.
             until(ready)
             with lock:
                 remote["status"] = 500
             management("/v0/management/cpa-relay/poll", method="POST")
             until(lambda: json.loads(management("/v0/management/cpa-relay/status")[1])["last_attempt"] == "fetch_failed")
             assert ready() and len(list(auth.glob("*.json"))) == 2
+            before = json.loads((root / "receiver/state.json").read_text())
+            mtimes = {p: p.stat().st_mtime_ns for p in auth.glob("*.json")}
+            with lock:
+                saves_before = sum(m == "host.auth.save" for m, _ in calls)
+            for _ in range(3):
+                configure(config)  # Same effective config during upstream outage.
+                assert ready() and not rpc("request.intercept_before", {"Stream": True})["Terminate"]
+            assert json.loads((root / "receiver/state.json").read_text()) == before
+            assert all(p.stat().st_mtime_ns == mtime for p, mtime in mtimes.items())
+            with lock:
+                assert sum(m == "host.auth.save" for m, _ in calls) == saves_before
             generation = time.time_ns()
             empty = {"version": 2, "generation": generation, "generated_at": stamp(generation), "accounts": []}
             with lock:
@@ -324,9 +337,20 @@ def main():
             until(lambda: not ready() and not list(auth.glob("*.json")))
             with lock:
                 assert all(a["disabled"] and not a["access_token"] for a in runtime.values())
-            configure(config)  # Same generation after restart must not authorize cached state.
+            rpc("plugin.quiesce", {})
+            configure(config, "plugin.register")  # New instance cannot authorize cached state.
             until(lambda: json.loads(management("/v0/management/cpa-relay/status")[1])["last_attempt"] == "replay_rejected")
             assert not ready()
+            publish(refreshed)
+            contaminated = next(auth.glob("*.json"))
+            bad = json.loads(contaminated.read_text())
+            bad["refresh_token"] = "SYNTHETIC_CONTAMINATION"
+            contaminated.write_bytes(dumps(bad))
+            until(lambda: json.loads(management("/v0/management/cpa-relay/status")[1])["last_attempt"] == "integrity_failed")
+            configure(config)  # No-op must preserve terminal quarantine, not clean/restart it.
+            assert not ready() and rpc("request.intercept_before", {})["Terminate"]
+            assert management("/v0/management/cpa-relay/poll", method="POST")[0] == 409
+            assert json.loads(management("/v0/management/cpa-relay/status")[1])["last_attempt"] == "integrity_failed"
             for path in ("/v0/resource/plugins/cpa-relay/ready", "/v0/resource/plugins/cpa-relay/status", "/v0/management/cpa-relay/status"):
                 public = management(path)[1]
                 assert fake_token.encode() not in public and bearer.encode() not in public and b"acct-a" not in public
@@ -343,7 +367,7 @@ def main():
             server.shutdown()
             server.server_close()
             server_thread.join(timeout=2)
-        print("PASS: native C ABI, automatic same-workspace discovery, export sanitization/auth, HTTPS pull, background save/models, unchanged no-write, isolated refresh, add/remove/delete-all, delayed routes, gate, replay, failed quiesce/reconfigure retained cleanup, authenticated drain, lifecycle, buffer ownership")
+        print("PASS: native C ABI, automatic same-workspace discovery, export sanitization/auth, HTTPS pull, background save/models, unchanged no-write/offline reconfigure, preserved drain/quarantine, isolated refresh, add/remove/delete-all, delayed routes, gate, cold-start replay, failed quiesce/reconfigure retained cleanup, authenticated drain, lifecycle, buffer ownership")
 
 
 if __name__ == "__main__":

@@ -19,6 +19,10 @@ secret=secrets.token_urlsafe(32);admin=secrets.token_urlsafe(32);api=secrets.tok
 run('docker','network','create','--internal',name)
 subnet=json.loads(run('docker','network','inspect',name))[0]['IPAM']['Config'][0]['Subnet']
 network=ipaddress.ip_network(subnet)
+# Pin fixture IPs: a restart must not reuse the stopped primary's address.
+# Docker requires an explicit subnet for static addresses; let IPAM pick it first.
+run('docker','network','rm',name)
+run('docker','network','create','--internal','--subnet',subnet,name)
 addresses={'exporter':str(network[2]),'receiver':str(network[3])}
 run('openssl','req','-x509','-newkey','rsa:2048','-nodes','-keyout',str(root/'key.pem'),'-out',str(root/'cert.pem'),'-days','1','-subj','/CN='+name+'-exporter','-addext','subjectAltName=DNS:'+name+'-exporter,IP:'+addresses['exporter'])
 for role in ('exporter','receiver'):
@@ -78,9 +82,18 @@ def assert_ready_models():
   assert code==200 and registration['models'], 'readiness without per-account model registration'
   assert any(m['id'] in public for m in registration['models']), 'registered account has no discoverable model'
  print('PASS: sampled readiness implies per-account model registration and model discovery (not inference)',flush=True)
+def global_reload(sequence):
+ # The actual stock config API saves a DIFFERENT plugin's settings, invoking
+ # host-wide plugin.reconfigure without changing Relay's effective settings.
+ code,_=call('receiver','/v8/management/config',admin,method='PATCH',body={'plugins':{'configs':{'unrelated-fixture':{'enabled':False,'priority':sequence}}}})
+ assert code==200, 'stock global configuration update failed'
+ code,listing=call('receiver','/v0/management/plugins',admin)
+ assert code==200 and any(p['id']=='unrelated-fixture' and not p['enabled'] for p in listing['plugins'])
+def receiver_state():return json.loads((root/'receiver/state/state.json').read_text())
+def receiver_ready():return call('receiver','/v0/resource/plugins/cpa-relay/ready')[0]==200
 try:
  for i,role in enumerate(('exporter','receiver')):
-  run('docker','run','-d','--name',name+'-'+role,'--network',name,'--env-file',str(root/'env'),'-v',str(root/role)+':/fixture',image,'./CLIProxyAPI','-config','/fixture/config.json')
+  run('docker','run','-d','--name',name+'-'+role,'--network',name,'--ip',addresses[role],'--env-file',str(root/'env'),'-v',str(root/role)+':/fixture',image,'./CLIProxyAPI','-config','/fixture/config.json')
   actual=json.loads(run('docker','inspect',name+'-'+role))[0]['NetworkSettings']['Networks'][name]['IPAddress']
   assert actual==addresses[role], 'unexpected fixture IP allocation'
  # Let stock CPA finish its initial directory scan before materializing new
@@ -99,6 +112,40 @@ try:
  print('PASS: automatic discovery preserves two physical logins sharing a workspace without relaying filenames')
  assert call('exporter','/v0/resource/plugins/cpa-relay/snapshot')[0]==401
  print('PASS: exporter authentication and projection')
+ before={p:(p.stat().st_ino,p.stat().st_mtime_ns) for p in receiver_files()}
+ global_reload(1)
+ assert receiver_ready() and len(before)==2
+ assert all(p.exists() and (p.stat().st_ino,p.stat().st_mtime_ns)==identity for p,identity in before.items()), 'healthy-primary unrelated reload rewrote or withdrew credentials'
+ assert_ready_models()
+ print('PASS: real stock unrelated-plugin reload preserves healthy-primary credentials without writes')
+ run('docker','stop','-t','1',name+'-exporter')
+ wait(lambda:call('receiver','/v0/management/cpa-relay/status',admin)[1].get('last_attempt')=='fetch_failed' and receiver_ready(),'offline-primary receiver retains bounded warm state')
+ frozen=receiver_state();deadline=datetime.datetime.fromisoformat(frozen['snapshot']['generated_at'].replace('Z','+00:00')).timestamp()+30
+ for sequence in (2,3,4):
+  global_reload(sequence)
+  assert receiver_ready() and receiver_state()==frozen, 'unchanged reload lost cache or extended its age'
+  assert all(p.exists() and (p.stat().st_ino,p.stat().st_mtime_ns)==identity for p,identity in before.items()), 'offline-primary unrelated reload withdrew credentials'
+ wait(lambda:not receiver_ready() and not receiver_files(),'warm cache expires and withdraws at original deadline despite repeated global reloads')
+ assert time.time()<=deadline+4 and receiver_state()['snapshot']==frozen['snapshot']
+ global_reload(5)
+ assert not receiver_ready() and not receiver_files(), 'expired warm state revived by unchanged global reload'
+ run('docker','start',name+'-exporter')
+ wait(receiver_ready,'fresh primary snapshot restores receiver after bounded outage')
+ assert_ready_models()
+ # A process restart is NOT an unchanged reconfigure. It must never authorize
+ # from even a still-fresh cached snapshot while the primary is unavailable.
+ run('docker','stop','-t','1',name+'-exporter')
+ wait(lambda:call('receiver','/v0/management/cpa-relay/status',admin)[1].get('last_attempt')=='fetch_failed' and receiver_ready(),'second outage starts with fresh warm state')
+ frozen=receiver_state()
+ run('docker','restart',name+'-receiver')
+ wait(lambda:call('receiver','/v0/management/cpa-relay/status',admin)[1].get('last_attempt')=='fetch_failed' and not receiver_ready() and not receiver_files(),'cold process restart stays closed and withdraws cached credentials during primary outage')
+ assert receiver_state()['snapshot']==frozen['snapshot']
+ global_reload(6)
+ assert not receiver_ready() and not receiver_files()
+ time.sleep(2) # Let the actual stock startup directory scan finish.
+ run('docker','start',name+'-exporter')
+ wait(receiver_ready,'cold receiver recovers only after a newer live snapshot')
+ assert_ready_models()
  files=receiver_files();assert len(files)==2
  assert all('refresh_token' not in json.loads(f.read_text()) for f in files)
  by_email={json.loads(f.read_text())['email']:f for f in files}
@@ -136,6 +183,9 @@ try:
  code,listing=call('receiver','/v0/management/auth-files',admin);assert code==200
  assert all(f.get('disabled') for f in listing['files'] if f.get('name')==files[0].name), 'drain left enabled runtime credential'
  assert json.loads((root/'receiver/state/state.json').read_text())['managed']==[]
+ global_reload(7)
+ assert not receiver_ready() and not receiver_files() and call('receiver','/v0/management/cpa-relay/status',admin)[1].get('state')=='stopped', 'unrelated global reload undid explicit drain'
+ print('PASS: explicit drain survives stock unrelated-plugin reload even with healthy primary')
  assert call('receiver','/v0/management/plugins/cpa-relay/enabled',admin,method='PATCH',body={'enabled':False})[0]==200
  wait(lambda:call('receiver','/v0/resource/plugins/cpa-relay/ready')[0]!=200 and not next(p for p in call('receiver','/v0/management/plugins',admin)[1]['plugins'] if p['id']=='cpa-relay')['enabled'],'stock CPA disable after drain')
  assert call('receiver','/v0/management/plugins/cpa-relay/enabled',admin,method='PATCH',body={'enabled':True})[0]==200

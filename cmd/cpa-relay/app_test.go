@@ -142,7 +142,7 @@ func TestExporterBridgeReadOnlyAndSecretFreeUI(t *testing.T) {
 	}
 }
 
-func TestReconfigureStopsWorkerAndReadinessNeverWaitsForLocks(t *testing.T) {
+func TestReconfigureAndReadinessNeverWaitForLocks(t *testing.T) {
 	a := &application{host: func(string, any, any) error { return errors.New("host unavailable") }}
 	config := appConfig(t, "receiver")
 	a.handle(pluginabi.MethodPluginRegister, registerRaw(config))

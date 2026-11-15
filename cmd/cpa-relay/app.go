@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -16,13 +18,19 @@ import (
 )
 
 type hostFunc func(string, any, any) error
+type settings struct {
+	config     relay.Config
+	secretHash [32]byte
+}
 type application struct {
-	mu      sync.RWMutex
-	engine  *relay.Engine
-	current atomic.Pointer[relay.Engine]
-	host    hostFunc
-	state   atomic.Value // immutable string; status must not wait for callbacks
-	fault   atomic.Bool
+	mu       sync.RWMutex
+	settings *settings
+	drained  bool // protected by mu; unchanged global reloads cannot undo drain
+	engine   *relay.Engine
+	current  atomic.Pointer[relay.Engine]
+	host     hostFunc
+	state    atomic.Value // immutable string; status must not wait for callbacks
+	fault    atomic.Bool
 }
 
 type hostSource struct{ call hostFunc }
@@ -159,16 +167,40 @@ func (a *application) stop() error {
 		a.engine = nil
 	}
 	a.current.Store(nil)
+	a.drained = true
 	a.state.Store("stopped")
 	return nil
 }
 
-func (a *application) configure(raw []byte) {
+func (a *application) configure(raw []byte, reconfigure bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	var req struct {
+		ConfigYAML    []byte `json:"config_yaml"`
+		SchemaVersion uint32 `json:"schema_version"`
+	}
+	var c relay.Config
+	var secret string
+	err := relay.ErrConfig
+	if json.Unmarshal(raw, &req) == nil && req.SchemaVersion == pluginabi.SchemaVersion {
+		c, secret, err = relay.ParseConfig(req.ConfigYAML)
+	}
+	var hash [32]byte
+	if err == nil {
+		hash = sha256.Sum256([]byte(secret))
+	}
+	// Stock CPA reconfigures every plugin for unrelated global config changes.
+	// Preserve both a configured instance (including quarantine/fault) and an
+	// explicit successful drain. Nothing here resets freshness or admission.
+	if reconfigure && err == nil && c.Enabled && a.settings != nil &&
+		a.settings.config == c && subtle.ConstantTimeCompare(hash[:], a.settings.secretHash[:]) == 1 &&
+		(a.drained || (a.engine != nil && a.state.Load() == "configured")) {
+		return
+	}
+	a.drained = false
 	a.state.Store("settings_invalid")
 	a.current.Store(nil)
-	// Stop old workers and withdraw their inventory before changing authority.
+	// Changed or invalid settings still withdraw before changing authority.
 	if a.engine != nil {
 		if err := a.engine.Stop(); err != nil {
 			a.state.Store("cleanup_failed")
@@ -176,14 +208,6 @@ func (a *application) configure(raw []byte) {
 		}
 		a.engine = nil
 	}
-	var req struct {
-		ConfigYAML    []byte `json:"config_yaml"`
-		SchemaVersion uint32 `json:"schema_version"`
-	}
-	if json.Unmarshal(raw, &req) != nil || req.SchemaVersion != pluginabi.SchemaVersion {
-		return
-	}
-	c, secret, err := relay.ParseConfig(req.ConfigYAML)
 	if err != nil {
 		if err == relay.ErrLegacyConfig {
 			a.state.Store("settings_migration_required")
@@ -200,6 +224,7 @@ func (a *application) configure(raw []byte) {
 		return
 	}
 	a.engine = e
+	a.settings = &settings{config: c, secretHash: hash}
 	a.current.Store(e)
 	a.state.Store("configured")
 	a.fault.Store(false)
@@ -208,7 +233,7 @@ func (a *application) configure(raw []byte) {
 func (a *application) handle(method string, raw []byte) []byte {
 	switch method {
 	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
-		a.configure(raw)
+		a.configure(raw, method == pluginabi.MethodPluginReconfigure)
 		// Keep the gate installed even for invalid settings. Never put a parser,
 		// filesystem, URL, host error, or credential into the RPC error envelope.
 		return success(metadata())
@@ -334,5 +359,5 @@ func metadata() any {
 		SchemaVersion uint32             `json:"schema_version"`
 		Metadata      pluginapi.Metadata `json:"metadata"`
 		Capabilities  map[string]bool    `json:"capabilities"`
-	}{pluginabi.SchemaVersion, pluginapi.Metadata{Name: "cpa-relay", Version: "0.2.0", Author: "NotRllyRn", GitHubRepository: "https://github.com/NotRllyRn/cpa-relay", ConfigFields: fields}, map[string]bool{"management_api": true, "request_interceptor": true, "request_interceptor_omit_body_before": true, "request_interceptor_omit_body_after": true}}
+	}{pluginabi.SchemaVersion, pluginapi.Metadata{Name: "cpa-relay", Version: "0.2.1", Author: "NotRllyRn", GitHubRepository: "https://github.com/NotRllyRn/cpa-relay", ConfigFields: fields}, map[string]bool{"management_api": true, "request_interceptor": true, "request_interceptor_omit_body_before": true, "request_interceptor_omit_body_after": true}}
 }
