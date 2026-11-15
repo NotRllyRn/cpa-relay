@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -218,6 +219,78 @@ func TestStartupCleanupRetriesWithoutRestart(t *testing.T) {
 	h.failDisabled = false
 	h.mu.Unlock()
 	wait(t, e.Ready)
+}
+
+func TestRuntimeQuarantineStopsPollingButRetriesContainment(t *testing.T) {
+	f := newFixture(t)
+	c := diskConfig(t, "receiver")
+	c.Endpoint = f.server.URL + SnapshotPath
+	c.PollSeconds = 1
+	h := diskHost(c.AuthDir)
+	f.set(t, snapshot(time.Now(), "acct-a"))
+	e, err := newEngine(c, secret(), h, f.transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		h.mu.Lock()
+		h.failDisabled = false
+		h.mu.Unlock()
+		if err := e.Stop(); err != nil {
+			t.Error("cleanup failed")
+		}
+	}()
+	wait(t, e.Ready)
+	name := e.store.filename("acct-a")
+	path := filepath.Join(c.AuthDir, name)
+	h.mu.Lock()
+	h.failDisabled = true
+	h.mu.Unlock()
+	if err := os.WriteFile(path, []byte(`{"refresh_token":"must-not-adopt"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	e.expire(time.Now())
+	if !e.quarantined.Load() || e.Ready() || !e.Gate() {
+		t.Fatal("runtime contamination did not quarantine admission")
+	}
+	calls := f.calls.Load()
+	// Neither control nor the pre-fetch guard may wait for reconciliation.
+	e.mu.Lock()
+	done := make(chan bool, 1)
+	go func() {
+		rejected := !e.Trigger()
+		e.pull(context.Background())
+		done <- rejected
+	}()
+	var rejected bool
+	select {
+	case rejected = <-done:
+	case <-time.After(time.Second):
+	}
+	e.mu.Unlock()
+	if !rejected {
+		t.Fatal("quarantined poll accepted work or waited for the engine lock")
+	}
+	// Also exercise the actual poll worker with a previously queued request,
+	// and allow multiple periodic poll/containment ticks to fire.
+	e.trigger <- struct{}{}
+	time.Sleep(2200 * time.Millisecond)
+	if f.calls.Load() != calls {
+		t.Fatal("terminal quarantine continued network polling")
+	}
+	if h.disabled(name) {
+		t.Fatal("failed containment unexpectedly acknowledged")
+	}
+	h.mu.Lock()
+	h.failDisabled = false
+	h.mu.Unlock()
+	wait(t, func() bool {
+		_, err := os.Stat(path)
+		return h.disabled(name) && os.IsNotExist(err)
+	})
+	if e.Trigger() || e.Ready() || !e.Gate() || f.calls.Load() != calls {
+		t.Fatal("successful containment cleared terminal quarantine")
+	}
 }
 
 func TestTerminatedWorkerRejectsTrigger(t *testing.T) {

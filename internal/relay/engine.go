@@ -68,7 +68,7 @@ type Engine struct {
 	worker      atomic.Bool
 	status      atomic.Pointer[Status]
 	modelsUntil atomic.Int64
-	quarantined bool
+	quarantined atomic.Bool
 	withdrawn   bool
 	live        atomic.Bool
 	serving     atomic.Bool
@@ -137,7 +137,7 @@ func (e *Engine) recoverWorker() {
 	if recover() != nil {
 		e.mu.Lock()
 		e.setReady(false)
-		e.quarantined = true
+		e.quarantined.Store(true)
 		e.lastAttempt = "internal_error"
 		e.publishStatus()
 		e.mu.Unlock()
@@ -172,7 +172,7 @@ func (e *Engine) initialize() bool {
 		e.withdrawn = true
 	}
 	if dirty {
-		e.quarantined = true
+		e.quarantined.Store(true)
 		e.lastAttempt = "integrity_failed"
 	} else if err != nil {
 		e.lastAttempt = "cleanup_failed"
@@ -191,10 +191,7 @@ func (e *Engine) run(ctx context.Context) {
 		if e.initialize() {
 			break
 		}
-		e.mu.Lock()
-		quarantined := e.quarantined
-		e.mu.Unlock()
-		if quarantined {
+		if e.quarantined.Load() {
 			return
 		}
 		timer := time.NewTimer(backoff)
@@ -227,7 +224,7 @@ func (e *Engine) run(ctx context.Context) {
 }
 
 func (e *Engine) Trigger() bool {
-	if !e.live.Load() || !e.worker.Load() || e.cfg.Role != "receiver" {
+	if !e.live.Load() || !e.worker.Load() || e.quarantined.Load() || e.cfg.Role != "receiver" {
 		return false
 	}
 	select {
@@ -287,7 +284,7 @@ func (e *Engine) fresh(now time.Time) bool {
 
 // Readiness and interception never wait for host callbacks or reconciliation.
 func (e *Engine) Ready() bool {
-	if !e.live.Load() {
+	if !e.live.Load() || e.quarantined.Load() {
 		return false
 	}
 	if e.cfg.Role == "exporter" {
@@ -399,12 +396,12 @@ func (e *Engine) expire(now time.Time) {
 	if e.stopped {
 		return
 	}
-	if e.reconciled && e.fresh(now) {
+	if !e.quarantined.Load() && e.reconciled && e.fresh(now) {
 		if e.store.audit(e.snapshot) == nil {
 			e.checkModels()
 			return
 		}
-		e.quarantined = true
+		e.quarantined.Store(true)
 		e.lastAttempt = "integrity_failed"
 	}
 	e.reconciled = false
@@ -447,11 +444,16 @@ func fetch(ctx context.Context, client *http.Client, endpoint, secret string, c 
 }
 
 func (e *Engine) pull(ctx context.Context) {
+	// Keep containment retries alive, but never poll a terminally quarantined
+	// receiver. Recheck after fetching in case quarantine began in flight.
+	if !e.live.Load() || e.quarantined.Load() || ctx.Err() != nil {
+		return
+	}
 	snap, err := fetch(ctx, e.client, e.cfg.Endpoint, e.secret, e.cfg)
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	defer e.publishStatus()
-	if !e.live.Load() || e.stopped || e.quarantined || ctx.Err() != nil {
+	if !e.live.Load() || e.stopped || e.quarantined.Load() || ctx.Err() != nil {
 		return
 	}
 	if err != nil {
