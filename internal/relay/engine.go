@@ -36,7 +36,7 @@ type Sink interface {
 }
 
 type Entry struct {
-	Index                        string
+	Index, Name                  string
 	Codex, RuntimeOnly, Disabled bool
 }
 
@@ -503,6 +503,10 @@ func (e *Engine) Export(now time.Time) ([]byte, error) {
 	if err != nil || len(entries) > 4096 {
 		return nil, ErrExport
 	}
+	entries, err = selectSources(entries, e.cfg.SourceFiles)
+	if err != nil {
+		return nil, ErrExport
+	}
 	s := Snapshot{Version: 1, Generation: now.UnixNano(), GeneratedAt: now, Accounts: []Account{}}
 	seen := map[string]bool{}
 	for _, entry := range entries {
@@ -518,6 +522,9 @@ func (e *Engine) Export(now time.Time) ([]byte, error) {
 			return nil, ErrExport
 		}
 		if !e.cfg.selected(id) {
+			if len(e.cfg.SourceFiles) != 0 {
+				return nil, ErrExport
+			}
 			continue
 		}
 		a, err := Sanitize(raw)

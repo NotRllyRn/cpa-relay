@@ -74,7 +74,7 @@ func TestInvalidSettingsKeepCapabilitiesGateAndPublicReadiness(t *testing.T) {
 }
 
 func TestExporterBridgeReadOnlyAndSecretFreeUI(t *testing.T) {
-	config := appConfig(t, "exporter")
+	config := appConfig(t, "exporter") + "source_files: [chosen.json]\n"
 	var mu sync.Mutex
 	var methods []string
 	now := time.Now()
@@ -86,8 +86,11 @@ func TestExporterBridgeReadOnlyAndSecretFreeUI(t *testing.T) {
 		mu.Unlock()
 		switch method {
 		case pluginabi.MethodHostAuthList:
-			json.Unmarshal(encoded(map[string]any{"files": []any{pluginapi.HostAuthFileEntry{AuthIndex: "index", Type: "codex"}}}), dst)
+			json.Unmarshal(encoded(map[string]any{"files": []any{pluginapi.HostAuthFileEntry{AuthIndex: "index", Name: "chosen.json", Type: "codex"}, pluginapi.HostAuthFileEntry{AuthIndex: "other", Name: "other.json", Type: "codex"}}}), dst)
 		case pluginabi.MethodHostAuthGet:
+			if request.(pluginapi.HostAuthGetRequest).AuthIndex != "index" {
+				return errors.New("unselected source read")
+			}
 			json.Unmarshal(encoded(pluginapi.HostAuthGetResponse{JSON: encoded(credential)}), dst)
 		default:
 			return errors.New("unexpected callback")
@@ -103,13 +106,13 @@ func TestExporterBridgeReadOnlyAndSecretFreeUI(t *testing.T) {
 		t.Fatal("unauthenticated export")
 	}
 	decodeResult(t, invoke(a, "GET", relay.SnapshotPath, http.Header{"Authorization": {"Bearer " + secret}}), &response)
-	if response.StatusCode != 200 || strings.Contains(string(response.Body), "DO-NOT-LEAK") {
+	if response.StatusCode != 200 || strings.Contains(string(response.Body), "DO-NOT-LEAK") || strings.Contains(string(response.Body), "chosen.json") || strings.Contains(string(response.Body), "other.json") {
 		t.Fatal("unsafe export")
 	}
 	for _, path := range []string{relay.ReadyPath, "/v0/resource/plugins/cpa-relay/status", "/v0/management/cpa-relay/status"} {
 		decodeResult(t, invoke(a, "GET", path, nil), &response)
 		body := string(response.Body)
-		if strings.Contains(body, secret) || strings.Contains(body, "acct-a") || strings.Contains(body, "e30.") || strings.Contains(body, "DO-NOT-LEAK") {
+		if strings.Contains(body, secret) || strings.Contains(body, "acct-a") || strings.Contains(body, "e30.") || strings.Contains(body, "DO-NOT-LEAK") || strings.Contains(body, "chosen.json") || strings.Contains(body, "other.json") {
 			t.Fatal("UI/status leak")
 		}
 	}

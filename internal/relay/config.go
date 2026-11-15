@@ -26,6 +26,7 @@ const MaxAccounts = 128
 var ErrConfig = errors.New("invalid relay settings")
 var idPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
 var envPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+var sourceFilePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._@+-]{0,254}$`)
 var ownerPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}$`)
 
 type Config struct {
@@ -35,6 +36,7 @@ type Config struct {
 	Endpoint          string   `yaml:"endpoint"`
 	SecretEnv         string   `yaml:"secret_env"`
 	Accounts          []string `yaml:"accounts"`
+	SourceFiles       []string `yaml:"source_files"`
 	PollSeconds       int      `yaml:"poll_seconds"`
 	MaxStaleSeconds   int      `yaml:"max_stale_seconds"`
 	ExpirySkewSeconds int      `yaml:"expiry_skew_seconds"`
@@ -74,6 +76,17 @@ func ParseConfig(raw []byte) (Config, string, error) {
 		seen[id] = true
 	}
 	sort.Strings(c.Accounts)
+	if len(c.SourceFiles) > MaxAccounts || (c.Role == "receiver" && c.SourceFiles != nil) {
+		return c, "", ErrConfig
+	}
+	seen = map[string]bool{}
+	for _, name := range c.SourceFiles {
+		if !sourceFilePattern.MatchString(name) || !strings.HasSuffix(strings.ToLower(name), ".json") || seen[name] {
+			return c, "", ErrConfig
+		}
+		seen[name] = true
+	}
+	sort.Strings(c.SourceFiles)
 	if c.Role == "receiver" {
 		u, e := url.Parse(c.Endpoint)
 		if e != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path != SnapshotPath || u.RawPath != "" || u.Opaque != "" || u.ForceQuery {

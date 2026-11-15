@@ -18,7 +18,7 @@ Before installation or config changes, back up the existing plugin, CPA config a
 
 ## Prepare both processes
 
-1. Obtain the Codex `account_id` values from the primary's credentials through a secure local/admin workflow. Select accounts explicitly on **both** roles; an empty selection is invalid. Do not use credential filenames, emails or auth indexes as selectors.
+1. Obtain the Codex `account_id` values from the primary's credentials through a secure local/admin workflow. Select account IDs explicitly in `accounts` on **both** roles; an empty selection is invalid. An `account_id` can identify a shared workspace, not a unique login/email. If several primary files share it, also select the intended physical basename in exporter-only `source_files`; never put a filename/email/auth index in `accounts`.
 2. Generate a dedicated secret locally, for example with Python's `secrets.token_urlsafe(32)`. Put its value in a protected service/container environment on both processes as `CPA_RELAY_BEARER`. Do not put it in YAML, shell history, URLs, browser fields or this repository. The accepted encoding is unpadded base64url representing 32–128 bytes. Randomness cannot be measured by the plugin; the operator must generate it securely.
 3. Start CPA with that environment already set. Native Go plugins read the process startup environment; changing an external environment file does not update a running process. Rotation requires coordinated process restarts. A secret is shared only by the intended primary/receiver pair.
 4. Provision explicit absolute state directories, owned by CPA's Unix user, mode `0700`. They must not contain symlinked path components. Ancestors must be owned by root or the CPA user and not be group/world writable (root-owned sticky directories such as `/tmp` are allowed). Receiver auth-dir must already exist, be owned by the same Unix user and not be group/world writable. The two directories may not contain each other. Do not put exporter state inside its CPA auth-dir either.
@@ -49,12 +49,17 @@ plugins:
       role: exporter
       secret_env: CPA_RELAY_BEARER
       accounts: [acct-example-a]
+      source_files: [codex-login-a.json] # Optional; exact primary physical basename.
       state_dir: /var/lib/example-relay/exporter
 ```
 
 The authenticated endpoint is `GET /v0/resource/plugins/cpa-relay/snapshot`, on the existing primary HTTPS listener. Its only authentication is one `Authorization: Bearer <dedicated relay secret>` header. Do not use a CPA management key. Restrict network access to intended receivers as well.
 
-The exporter calls only `host.auth.list` and `host.auth.get`. It never saves, refreshes or deletes credentials. It reads Codex physical sources and emits only selected account IDs. Unknown source fields are discarded. Duplicate-free JSON structure and an unambiguous `account_id` are checked first; clearly unselected sources are then skipped before interpreting their token/optional fields. Ambiguous identity, read errors, duplicate selected IDs or malformed selected credentials make the export fail as a whole. Expired selected accounts are omitted from a successful full snapshot; disabling or deselecting one propagates removal. A successful empty snapshot is valid, but cannot make a receiver ready.
+The exporter calls only `host.auth.list` and `host.auth.get`. It never saves, refreshes or deletes credentials. Optional `source_files` first filters the list by **exact, case-sensitive physical basename**, before any file read or identity parsing. Obtain the name through a secure local/admin workflow: in pinned stock CPA, the file watcher sets `Auth.FileName` to `filepath.Base(fullPath)`, and `host.auth.list` exposes it as `Name` (`name` in JSON). Do not use a display label, email, auth index, path or glob. Every configured source must appear exactly once as a physical Codex entry with an unambiguous nonempty auth index; a missing source, duplicate name or index alias fails the whole export with 503. No fallback login is chosen. Unselected files are not read, so malformed unrelated JSON/token fields cannot block this mode. Filenames remain on the exporter and are not included in the snapshot or public status.
+
+`accounts` is still mandatory. Every explicitly selected file must have an allowlisted account ID; a mismatch fails export. **The receiver supports one credential per workspace/account ID**, not several logins sharing that ID. Selecting two files with the same account ID still fails rather than choosing one arbitrarily. Omit `source_files` (or use `[]` on the exporter) to preserve account-only scanning and duplicate rejection.
+
+After source selection, unknown source fields are discarded. Duplicate-free JSON structure and an unambiguous `account_id` are checked first; in account-only mode, clearly unselected identities are skipped before interpreting their token/optional fields. Ambiguous identity, read errors, duplicate selected IDs or malformed selected credentials fail the export as a whole. Expired selected accounts are omitted from a successful full snapshot; disabling a selected credential propagates withdrawal. With `source_files`, deleting/renaming a required file is an **error**, not an authoritative removal: the receiver retains its prior state only until its original deadline. To withdraw deliberately while retaining the source pin, disable that credential and keep its source file present. A successful empty/all-disabled snapshot cannot make a receiver ready.
 
 ## Receiver
 
@@ -96,6 +101,7 @@ Settings are described by CPA `ConfigFields` and can be changed through its norm
 | `role` | Required: `exporter` or `receiver` |
 | `secret_env` | Required environment variable **name**, never its value |
 | `accounts` | Required unique array, 1–128 account IDs; letters/digits/underscore/hyphen, first character alphanumeric, maximum 128 characters each |
+| `source_files` | Exporter only, optional unique array of at most 128 exact basenames. Omitted/empty means account-only scanning. Each is 1–255 ASCII characters, first alphanumeric, remaining letters/digits/`.`/`_`/`@`/`+`/`-`, ending in `.json` (extension case may vary). No paths, whitespace, encoding, wildcards or normalization. Receiver must omit this field (even `[]` is rejected). |
 | `state_dir` | Required absolute private directory, not symlinked |
 | `endpoint` | Receiver only; exact HTTPS snapshot path, no user info, query or fragment |
 | `auth_dir` | Receiver only; absolute, exact CPA auth-dir |
@@ -104,7 +110,7 @@ Settings are described by CPA `ConfigFields` and can be changed through its norm
 | `max_stale_seconds` | 3600; at least twice poll interval, at most 86400 |
 | `expiry_skew_seconds` | 60; range 5–600 |
 
-CPA also supplies its standard `enabled` and `priority` fields. Other settings are rejected. Source endpoint, role, auth-dir and receiver namespace are bound to the state file. To change that authority/namespace, stop the old role and verify cleanup, keep its private state for rollback, and provision a **new empty state directory**. Account selection and timing settings can change in place while preserving the replay watermark. Do not delete state to work around an error.
+CPA also supplies its standard `enabled` and `priority` fields. Other settings are rejected. Source endpoint, role, auth-dir and receiver namespace are bound to the state file. To change that authority/namespace, stop the old role and verify cleanup, keep its private state for rollback, and provision a **new empty state directory**. Account/source-file selection and timing settings can change in place while preserving the replay watermark. Do not delete state to work around an error.
 
 ## Status, control and ingress
 
