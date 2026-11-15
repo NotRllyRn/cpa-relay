@@ -77,7 +77,7 @@ plugins:
   dir: /opt/example-cpa/plugins
   configs:
     cpa-relay:
-      enabled: true
+      enabled: false # enable through management only after CPA's initial scan
       priority: 100
       role: receiver
       endpoint: https://primary.example.invalid/v0/resource/plugins/cpa-relay/snapshot
@@ -91,6 +91,14 @@ plugins:
 ```
 
 `auth_dir` must exactly match CPA's resolved absolute `oauth.auth-dir`; disabled staging verifies the host's save path before enabling credentials. Reserve `cpa-relay-<receiver_id>-<sha256(credential_id)>.json`. Never log in, add renewal/SIWC material or manually replace files in this namespace. Existing files outside durable ownership are refused, not adopted/deleted. Keep unrelated credentials elsewhere; do not share the namespace across processes. A hidden auth-dir namespace lock is also used.
+
+### Receiver process startup
+
+Stock CPA v8.0.63 can race its initial auth-directory scan against plugin saves/model registration. This host race is **not fixed** by the relay. Keep receiver ingress denied throughout startup; a disabled plugin has no interception gate.
+
+1. Start the receiver CPA process with `plugins.configs.cpa-relay.enabled: false` (global `plugins.enabled` stays true), as above. Before planned restarts, first successfully drain the enabled receiver, then stage this disabled startup setting; never disable an undrained live receiver to follow this sequence.
+2. Wait for CPA's initial auth-directory scan to finish and its authenticated management API to become available. Confirm scan completion in local startup diagnostics; a reachable API or fixed sleep alone is not proof.
+3. Using local CPA management authentication, send `PATCH /v0/management/plugins/cpa-relay/enabled` with JSON `{"enabled":true}`. This is not authenticated with the relay export bearer. Require a newer live snapshot, the expected credential count, registered models for every active record and HTTP 200 readiness before admitting traffic. Management enable may persist `enabled: true`; stage the disabled startup setting again after a successful drain before the next process start.
 
 ### Settings
 
@@ -118,8 +126,8 @@ This is an intentional protocol, state and authorization break, not an in-place 
 2. While the **old receiver binary is still enabled with working callbacks and its original config/state**, call authenticated `POST /v0/management/cpa-relay/drain`. Require HTTP 200 and `state: drained`. Verify readiness is non-200, old inventory `managed` is empty, and every formerly owned file is gone/runtime-disabled. A 503/timeout is **not** success; retain old state/binary and retry. Never just remove the state directory or disable first.
 3. Only after verified drain, stop CPA safely and retain a separate post-drain old-state copy for rollback. Back up/stop the exporter too. Replace both binaries together; mixed v1/v2 peers cannot sync. Preserve the old private directories unchanged.
 4. Explicitly remove the old `accounts` and `source_files` keys from **both** configs, including empty/null values. Their presence returns `settings_migration_required`; removing them is the operator's authorization to export all current and future Codex credentials. They no longer appear in the UI. Provision **new empty** mode-0700 v2 state directories on both roles. Keep the same auth-dir/receiver ID only after the old namespace is confirmed drained. Do not point the new binary at v1 cache or try editing its version/binding.
-5. Start the exporter, then receiver; require a newer authenticated live v2 snapshot, correct expected credential count, receiver readiness and registered models for every active record. Recheck logging and ingress fail-closed behavior. Only then admit traffic. Do not copy real snapshot bodies into logs/reports.
-6. Rollback: deny ingress and drain the **new** receiver successfully while its callbacks still work. Stop CPA; restore old binaries/configs and paired **post-drain** old state with original permissions. Restart exporter then receiver and require a newer live v1 snapshot/readiness before admitting traffic. A pre-drain backup has outstanding ownership obligations; never silently discard them. If a drain fails, keep ingress denied and the matching state/binary available for recovery.
+5. Start the exporter, then start the receiver **process with its relay plugin disabled** (`plugins.configs.cpa-relay.enabled: false`; global plugins remain enabled). Wait for CPA's initial auth-directory scan to complete, then enable the plugin using authenticated `PATCH /v0/management/plugins/cpa-relay/enabled` with `{"enabled":true}`, following [receiver process startup](#receiver-process-startup). Require a newer authenticated live v2 snapshot, correct expected credential count, receiver readiness and registered models for every active record. Recheck logging and ingress fail-closed behavior. Only then admit traffic. Do not copy real snapshot bodies into logs/reports.
+6. Rollback: deny ingress and drain the **new** receiver successfully while its callbacks still work. Stop CPA; restore old binaries/configs and paired **post-drain** old state with original permissions. Restart exporter then receiver using the same [disabled-plugin startup sequence](#receiver-process-startup); retain the restored v1 authority/selection/state settings. After the initial scan, enable through management and require a newer live v1 snapshot, registered models and readiness before admitting traffic. A pre-drain backup has outstanding ownership obligations; never silently discard them. If a drain fails, keep ingress denied and the matching state/binary available for recovery.
 
 ## Status, control and ingress
 

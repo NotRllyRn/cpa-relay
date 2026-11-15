@@ -1,7 +1,9 @@
 package relay
 
 import (
+	"bytes"
 	"encoding/base64"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -196,6 +198,96 @@ func TestStorePartialWriteFailureKeepsInventory(t *testing.T) {
 	os.Remove(filepath.Join(c.AuthDir, s.filename(credentialID("acct-b"))))
 	if s.withdrawRuntime(diskHost(c.AuthDir)) != nil {
 		t.Fatal("cleanup retry failed")
+	}
+}
+
+func TestStoreChurnWithFailedCleanupRemainsRestartable(t *testing.T) {
+	c := diskConfig(t, "receiver")
+	s, err := openStore(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if s != nil {
+			s.close()
+		}
+	}()
+	h := diskHost(c.AuthDir)
+	now := time.Now().UTC()
+	snapshots := make([]Snapshot, 3)
+	for generation := range snapshots {
+		snap := snapshot(now.Add(time.Duration(generation) * time.Nanosecond))
+		for i := 0; i < MaxAccounts; i++ {
+			a := account(now, "workspace")
+			a.CredentialID = credentialID(fmt.Sprintf("/sources/generation-%d/source-%d.json", generation, i))
+			snap.Accounts = append(snap.Accounts, a)
+		}
+		snapshots[generation] = snap
+	}
+	if s.accept(snapshots[0]) != nil || s.reconcile(snapshots[0], h) != nil {
+		t.Fatal("initial full inventory")
+	}
+	h.failDisabled = true
+	if s.accept(snapshots[1]) != nil || len(s.state.Managed) != maxManaged {
+		t.Fatal("two disjoint inventories must fit the durable bound")
+	}
+	if s.reconcile(snapshots[1], h) != ErrStorage || s.withdrawRuntime(h) != ErrStorage {
+		t.Fatal("disabled-save failures did not retain cleanup obligations")
+	}
+	stateBefore := marshal(t, s.state)
+	path := filepath.Join(c.StateDir, "state.json")
+	cacheBefore, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statBefore, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Neither accepting another generation nor bypassing accept via save may
+	// write an oversized inventory or change the accepted watermark/snapshot.
+	oversized := s.state
+	oversized.Managed = append(append([]string{}, oversized.Managed...), snapshots[2].Accounts[0].CredentialID)
+	for _, reject := range []func() error{
+		func() error { return s.accept(snapshots[2]) },
+		func() error { return s.save(oversized) },
+	} {
+		if reject() != ErrStorage {
+			t.Fatal("unrecoverable ownership growth accepted")
+		}
+		cacheAfter, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		statAfter, err := os.Stat(path)
+		if err != nil || !statAfter.ModTime().Equal(statBefore.ModTime()) ||
+			!bytes.Equal(cacheBefore, cacheAfter) || !bytes.Equal(stateBefore, marshal(t, s.state)) {
+			t.Fatal("rejected churn mutated memory or durable state")
+		}
+	}
+	// Simulate a process restart without successful cleanup. The last accepted
+	// cache and every old/new ownership obligation must still be loadable.
+	s.close()
+	s, err = openStore(c)
+	if err != nil {
+		t.Fatal("failed cleanup made receiver unrestartable:", err)
+	}
+	if !bytes.Equal(stateBefore, marshal(t, s.state)) || s.withdrawRuntime(h) != ErrStorage || len(s.state.Managed) != maxManaged {
+		t.Fatal("restart lost ownership or stopped retrying failed cleanup")
+	}
+	owned := append([]string{}, s.state.Managed...)
+	h.failDisabled = false
+	if s.withdrawRuntime(h) != nil || len(s.state.Managed) != 0 {
+		t.Fatal("cleanup did not recover after callback repair")
+	}
+	for _, id := range owned {
+		name := s.filename(id)
+		if _, err := os.Stat(filepath.Join(c.AuthDir, name)); !os.IsNotExist(err) || !h.disabled(name) {
+			t.Fatal("owned credential not disabled before deletion")
+		}
+	}
+	if s.state.Watermark != snapshots[1].Generation || s.accept(snapshots[2]) != nil || s.reconcile(snapshots[2], h) != nil {
+		t.Fatal("cleanup did not restore capacity for rejected generation")
 	}
 }
 

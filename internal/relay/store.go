@@ -17,6 +17,9 @@ import (
 
 var ErrStorage = errors.New("relay storage unavailable")
 
+// Bound outstanding cleanup plus the next full inventory, including on disk.
+const maxManaged = MaxAccounts * 2
+
 type diskState struct {
 	Version     int       `json:"version"`
 	Binding     string    `json:"binding"`
@@ -105,7 +108,7 @@ func openStore(c Config) (_ *store, err error) {
 	s.state = diskState{Version: 2, Binding: c.binding(), Managed: []string{}}
 	raw, e := readPrivate(s.root, "state.json")
 	if e == nil {
-		if strictJSON(raw, &s.state) != nil || s.state.Version != 2 || s.state.Binding != c.binding() || s.state.Watermark < 0 || len(s.state.Managed) > MaxAccounts*2 {
+		if strictJSON(raw, &s.state) != nil || s.state.Version != 2 || s.state.Binding != c.binding() || s.state.Watermark < 0 || len(s.state.Managed) > maxManaged {
 			return nil, ErrStorage
 		}
 		if len(s.state.SourcePaths) > MaxAccounts || (c.Role != "exporter" && len(s.state.SourcePaths) != 0) {
@@ -212,6 +215,9 @@ func syncDir(root *os.Root) error {
 }
 
 func (s *store) save(st diskState) error {
+	if len(st.Managed) > maxManaged {
+		return ErrStorage
+	}
 	b, e := json.Marshal(st)
 	if e != nil || len(b) > MaxBody || atomicWrite(s.root, "state.json", b) != nil {
 		return ErrStorage
@@ -240,6 +246,12 @@ func (s *store) accept(snap Snapshot) error {
 			}
 		}
 		ids[a.CredentialID] = true
+	}
+	// Failed withdrawal can leave several generations owned. Reject more churn
+	// before changing state; never persist an inventory that cannot be reopened
+	// or truncate cleanup obligations to make room for new credentials.
+	if len(ids) > maxManaged {
+		return ErrStorage
 	}
 	managed := make([]string, 0, len(ids))
 	for id := range ids {
