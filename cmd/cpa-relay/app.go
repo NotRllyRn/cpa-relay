@@ -264,7 +264,12 @@ func (a *application) handle(method string, raw []byte) []byte {
 }
 
 func response(status int, content string, body []byte) []byte {
-	return success(pluginapi.ManagementResponse{StatusCode: status, Headers: http.Header{"Content-Type": {content}, "Cache-Control": {"no-store"}, "X-Content-Type-Options": {"nosniff"}, "Content-Security-Policy": {"default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"}, "Referrer-Policy": {"no-referrer"}}, Body: body})
+	ancestors := "'none'"
+	if content == "text/html; charset=utf-8" {
+		// CPA embeds the status resource in its same-origin management dashboard.
+		ancestors = "'self'"
+	}
+	return success(pluginapi.ManagementResponse{StatusCode: status, Headers: http.Header{"Content-Type": {content}, "Cache-Control": {"no-store"}, "X-Content-Type-Options": {"nosniff"}, "Content-Security-Policy": {"default-src 'none'; frame-ancestors " + ancestors + "; base-uri 'none'; form-action 'none'"}, "Referrer-Policy": {"no-referrer"}}, Body: body})
 }
 func jsonResponse(status int, v any) []byte {
 	b, _ := json.Marshal(v)
@@ -291,7 +296,7 @@ func (a *application) management(raw []byte) []byte {
 		if ready {
 			label = "READY"
 		}
-		return response(200, "text/html; charset=utf-8", []byte(`<!doctype html><html lang="en"><meta charset="utf-8"><title>CPA Relay</title><h1>CPA Relay</h1><p>`+label+`</p><p>Reload to update. Use CPA plugin settings for role, endpoint and account selection. Authenticated controls: GET /v0/management/cpa-relay/status and POST /v0/management/cpa-relay/poll and /drain. Drain successfully before disabling or unloading.</p><p>Ingress must fail closed unless /v0/resource/plugins/cpa-relay/ready returns HTTP 200. Do not expose a direct bypass.</p></html>`))
+		return response(200, "text/html; charset=utf-8", []byte(`<!doctype html><html lang="en"><meta charset="utf-8"><title>CPA Relay</title><h1>CPA Relay</h1><p>`+label+`</p><p>Reload to update. Use CPA plugin settings for role and endpoint. Codex credentials synchronize automatically. Authenticated controls: GET /v0/management/cpa-relay/status and POST /v0/management/cpa-relay/poll and /drain. Drain successfully before disabling or unloading.</p><p>Ingress must fail closed unless /v0/resource/plugins/cpa-relay/ready returns HTTP 200. Do not expose a direct bypass.</p></html>`))
 	}
 	// These paths are registered only with CPA's admin-authenticated management
 	// router. Never register drain as a public resource.
@@ -359,5 +364,5 @@ func metadata() any {
 		SchemaVersion uint32             `json:"schema_version"`
 		Metadata      pluginapi.Metadata `json:"metadata"`
 		Capabilities  map[string]bool    `json:"capabilities"`
-	}{pluginabi.SchemaVersion, pluginapi.Metadata{Name: "cpa-relay", Version: "0.2.1", Author: "NotRllyRn", GitHubRepository: "https://github.com/NotRllyRn/cpa-relay", ConfigFields: fields}, map[string]bool{"management_api": true, "request_interceptor": true, "request_interceptor_omit_body_before": true, "request_interceptor_omit_body_after": true}}
+	}{pluginabi.SchemaVersion, pluginapi.Metadata{Name: "cpa-relay", Version: "0.2.2", Author: "NotRllyRn", GitHubRepository: "https://github.com/NotRllyRn/cpa-relay", ConfigFields: fields}, map[string]bool{"management_api": true, "request_interceptor": true, "request_interceptor_omit_body_before": true, "request_interceptor_omit_body_after": true}}
 }
