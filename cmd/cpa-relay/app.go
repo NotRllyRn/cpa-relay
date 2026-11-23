@@ -273,7 +273,7 @@ func (a *application) handle(method string, raw []byte) []byte {
 			Resources []pluginapi.ResourceRoute   `json:"resources"`
 		}{
 			Routes:    []pluginapi.ManagementRoute{{Method: "GET", Path: "/cpa-relay/status"}, {Method: "POST", Path: "/cpa-relay/poll"}, {Method: "POST", Path: "/cpa-relay/drain"}},
-			Resources: []pluginapi.ResourceRoute{{Path: "/status", Menu: "CPA Relay", Description: "Coarse relay readiness; configure through CPA plugin settings."}, {Path: "/ready"}, {Path: "/snapshot"}},
+			Resources: []pluginapi.ResourceRoute{{Path: "/status", Menu: "CPA Relay", Description: "Read-only relay dashboard; sign in with a CPA management key."}, {Path: "/ready"}, {Path: "/snapshot"}},
 		})
 	case pluginabi.MethodRequestInterceptBefore, pluginabi.MethodRequestInterceptAfter:
 		e := a.current.Load()
@@ -289,12 +289,11 @@ func (a *application) handle(method string, raw []byte) []byte {
 }
 
 func response(status int, content string, body []byte) []byte {
-	ancestors := "'none'"
+	policy := "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
 	if content == "text/html; charset=utf-8" {
-		// CPA embeds the status resource in its same-origin management dashboard.
-		ancestors = "'self'"
+		policy = dashboardCSP
 	}
-	return success(pluginapi.ManagementResponse{StatusCode: status, Headers: http.Header{"Content-Type": {content}, "Cache-Control": {"no-store"}, "X-Content-Type-Options": {"nosniff"}, "Content-Security-Policy": {"default-src 'none'; frame-ancestors " + ancestors + "; base-uri 'none'; form-action 'none'"}, "Referrer-Policy": {"no-referrer"}}, Body: body})
+	return success(pluginapi.ManagementResponse{StatusCode: status, Headers: http.Header{"Content-Type": {content}, "Cache-Control": {"no-store"}, "X-Content-Type-Options": {"nosniff"}, "Content-Security-Policy": {policy}, "Referrer-Policy": {"no-referrer"}}, Body: body})
 }
 func jsonResponse(status int, v any) []byte {
 	b, _ := json.Marshal(v)
@@ -306,22 +305,18 @@ func (a *application) management(raw []byte) []byte {
 	if json.Unmarshal(raw, &req) != nil {
 		return jsonResponse(400, map[string]string{"error": "invalid request"})
 	}
-	// Public probes must never wait for a reconfigure/host callback lock.
-	if req.Method == "GET" && (req.Path == relay.ReadyPath || req.Path == "/v0/resource/plugins/cpa-relay/status") {
+	// The public shell never includes private state or waits for callbacks.
+	if req.Method == "GET" && req.Path == "/v0/resource/plugins/cpa-relay/status" {
+		return response(200, "text/html; charset=utf-8", dashboardHTML)
+	}
+	if req.Method == "GET" && req.Path == relay.ReadyPath {
 		e := a.current.Load()
 		ready := e != nil && !a.fault.Load() && e.Ready()
-		if req.Path == relay.ReadyPath {
-			status := 503
-			if ready {
-				status = 200
-			}
-			return jsonResponse(status, map[string]bool{"ready": ready})
-		}
-		label := "NOT READY"
+		status := 503
 		if ready {
-			label = "READY"
+			status = 200
 		}
-		return response(200, "text/html; charset=utf-8", []byte(`<!doctype html><html lang="en"><meta charset="utf-8"><title>CPA Relay</title><h1>CPA Relay</h1><p>`+label+`</p><p>Reload to update. Use CPA plugin settings for role and endpoint. Codex credentials synchronize automatically. Authenticated controls: GET /v0/management/cpa-relay/status and POST /v0/management/cpa-relay/poll and /drain. Drain successfully before disabling or unloading.</p><p>Ingress must fail closed unless /v0/resource/plugins/cpa-relay/ready returns HTTP 200. Do not expose a direct bypass.</p></html>`))
+		return jsonResponse(status, map[string]bool{"ready": ready})
 	}
 	// These paths are registered only with CPA's admin-authenticated management
 	// router. Never register drain as a public resource.
@@ -397,5 +392,5 @@ func metadata() any {
 		SchemaVersion uint32             `json:"schema_version"`
 		Metadata      pluginapi.Metadata `json:"metadata"`
 		Capabilities  map[string]bool    `json:"capabilities"`
-	}{pluginabi.SchemaVersion, pluginapi.Metadata{Name: "cpa-relay", Version: "0.2.2", Author: "NotRllyRn", GitHubRepository: "https://github.com/NotRllyRn/cpa-relay", ConfigFields: fields}, map[string]bool{"management_api": true, "request_interceptor": true, "request_interceptor_omit_body_before": true, "request_interceptor_omit_body_after": true}}
+	}{pluginabi.SchemaVersion, pluginapi.Metadata{Name: "cpa-relay", Version: "0.3.0", Author: "NotRllyRn", GitHubRepository: "https://github.com/NotRllyRn/cpa-relay", ConfigFields: fields}, map[string]bool{"management_api": true, "request_interceptor": true, "request_interceptor_omit_body_before": true, "request_interceptor_omit_body_after": true}}
 }

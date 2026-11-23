@@ -19,6 +19,9 @@ func TestStatusAllowsOnlySameOriginEmbedding(t *testing.T) {
 		decodeResult(t, invoke(a, "GET", tc.path, nil), &r)
 		csp := r.Headers.Get("Content-Security-Policy")
 		want := "default-src 'none'; frame-ancestors " + tc.ancestors + "; base-uri 'none'; form-action 'none'"
+		if tc.ancestors == "'self'" {
+			want = dashboardCSP
+		}
 		if csp != want {
 			t.Fatalf("%s: unexpected policy %q", tc.path, csp)
 		}
