@@ -64,7 +64,7 @@ func (h *mockHost) Save(name string, raw []byte) (string, error) {
 	h.mu.Unlock()
 	return path, nil
 }
-func (h *mockHost) ModelsReady(paths []string) (bool, error) {
+func (h *mockHost) CheckModels(paths []string) (ModelStatus, error) {
 	h.mu.Lock()
 	hook := h.beforeModels
 	h.mu.Unlock()
@@ -74,18 +74,18 @@ func (h *mockHost) ModelsReady(paths []string) (bool, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.modelsErr {
-		return false, ErrStorage
+		return ModelStatus{}, ErrStorage
 	}
 	if h.modelsMissing || len(paths) == 0 {
-		return false, nil
+		return ModelStatus{Reason: "models_pending"}, nil
 	}
 	for _, p := range paths {
 		a, ok := h.runtime[filepath.Base(p)]
 		if !ok || a.Disabled {
-			return false, nil
+			return ModelStatus{Reason: "models_pending"}, nil
 		}
 	}
-	return true, nil
+	return ModelStatus{Available: len(paths), Reason: "ready"}, nil
 }
 
 func (h *mockHost) disabled(name string) bool {

@@ -86,38 +86,44 @@ func (s hostSource) Save(name string, raw []byte) (string, error) {
 	return out.Path, err
 }
 
-// ModelsReady joins the manager-backed runtime identity to its model registry
-// entry. A disk file, unrelated credential, or a disabled/error record is not
-// evidence of an available route. Model registration does not prove inference.
-func (s hostSource) ModelsReady(paths []string) (bool, error) {
+// CheckModels requires an exact enabled runtime/model identity for every path.
+// Raw CPA error state can outlive its cooldown: it must not veto independently
+// active accounts, or be guessed healthy from an elapsed retry timestamp.
+func (s hostSource) CheckModels(paths []string) (relay.ModelStatus, error) {
 	var models pluginapi.HostAuthModelsResponse
 	if err := s.call(pluginabi.MethodHostAuthModels, pluginapi.HostAuthModelsRequest{}, &models); err != nil {
-		return false, err
+		return relay.ModelStatus{}, err
 	}
 	var files struct {
 		Files []pluginapi.HostAuthFileEntry `json:"files"`
 	}
 	if err := s.call(pluginabi.MethodHostAuthList, struct{}{}, &files); err != nil {
-		return false, err
+		return relay.ModelStatus{}, err
 	}
+	result := relay.ModelStatus{Reason: "models_pending"}
 	if len(paths) == 0 {
-		return false, nil
+		return result, nil
 	}
+	ids, indexes := map[string]bool{}, map[string]bool{}
 	for _, path := range paths {
 		var found *pluginapi.HostAuthFileEntry
 		for i := range files.Files {
 			f := &files.Files[i]
-			if f.Path != path || f.Name != filepath.Base(path) {
+			if f.Path != path {
 				continue
 			}
 			if found != nil {
-				return false, nil
+				return relay.ModelStatus{Reason: "runtime_mismatch"}, nil
 			}
 			found = f
 		}
 		f := found
-		if f == nil || f.ID == "" || f.AuthIndex == "" || f.Provider != "codex" || f.RuntimeOnly || f.Disabled || f.Unavailable || f.Status != "active" {
-			return false, nil
+		if f == nil || f.Name != filepath.Base(path) || f.ID == "" || f.AuthIndex == "" || f.Provider != "codex" || (f.Type != "" && f.Type != "codex") || f.RuntimeOnly || ids[f.ID] || indexes[f.AuthIndex] {
+			return relay.ModelStatus{Reason: "runtime_mismatch"}, nil
+		}
+		ids[f.ID], indexes[f.AuthIndex] = true, true
+		if f.Disabled || f.Status == "disabled" {
+			return relay.ModelStatus{Reason: "runtime_disabled"}, nil
 		}
 		matched := 0
 		for _, m := range models.Credentials {
@@ -126,7 +132,7 @@ func (s hostSource) ModelsReady(paths []string) (bool, error) {
 			}
 			matched++
 			if m.ID != f.ID || m.Provider != "codex" {
-				return false, nil
+				return relay.ModelStatus{Reason: "runtime_mismatch"}, nil
 			}
 			usable := false
 			for _, id := range m.Models {
@@ -135,14 +141,27 @@ func (s hostSource) ModelsReady(paths []string) (bool, error) {
 				}
 			}
 			if !usable {
-				return false, nil
+				return relay.ModelStatus{Reason: "models_pending"}, nil
 			}
 		}
 		if matched != 1 {
-			return false, nil
+			return relay.ModelStatus{Reason: "models_pending"}, nil
+		}
+		// Neither historical successes nor retry deadlines prove current auth health.
+		// In particular a rejected access token can retain an elapsed retry deadline.
+		if f.Status == "active" && !f.Unavailable {
+			result.Available++
 		}
 	}
-	return true, nil
+	switch {
+	case result.Available == 0:
+		result.Reason = "no_available_accounts"
+	case result.Available < len(paths):
+		result.Reason = "degraded"
+	default:
+		result.Reason = "ready"
+	}
+	return result, nil
 }
 
 func success(v any) []byte {
@@ -156,6 +175,7 @@ func failure() []byte {
 }
 
 func (a *application) stop() error {
+	a.state.Store("stopping")
 	a.current.Store(nil)
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -198,7 +218,11 @@ func (a *application) configure(raw []byte, reconfigure bool) {
 		return
 	}
 	a.drained = false
-	a.state.Store("settings_invalid")
+	if a.engine != nil {
+		a.state.Store("stopping")
+	} else {
+		a.state.Store("starting")
+	}
 	a.current.Store(nil)
 	// Changed or invalid settings still withdraw before changing authority.
 	if a.engine != nil {
@@ -209,6 +233,7 @@ func (a *application) configure(raw []byte, reconfigure bool) {
 		a.engine = nil
 	}
 	if err != nil {
+		a.state.Store("settings_invalid")
 		if err == relay.ErrLegacyConfig {
 			a.state.Store("settings_migration_required")
 		}
@@ -313,7 +338,15 @@ func (a *application) management(raw []byte) []byte {
 			if v := a.state.Load(); v != nil {
 				state = v.(string)
 			}
-			return jsonResponse(200, map[string]any{"ready": false, "state": state})
+			if a.fault.Load() {
+				if e != nil {
+					status := e.Status()
+					status.Ready, status.State, status.Reason, status.AvailableAccounts = false, "unready", "internal_error", 0
+					return jsonResponse(200, status)
+				}
+				state = "internal_error"
+			}
+			return jsonResponse(200, relay.Status{State: state, Reason: state, LastAttempt: state})
 		}
 		return jsonResponse(200, e.Status())
 	}
