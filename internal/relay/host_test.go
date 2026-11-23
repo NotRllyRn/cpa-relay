@@ -159,9 +159,16 @@ func TestRuntimeUpdateErrorAndConcurrentContaminationFailReadiness(t *testing.T)
 			if e.Ready() || !e.Gate() {
 				t.Fatal("unsafe runtime state ready")
 			}
-			if !h.disabled(e.store.filename(credentialID("acct-a"))) {
-				t.Fatal("failed update not synchronously disabled")
-			}
+			// Failure is now published before containment callbacks, so diagnostics
+			// remain useful if a callback blocks. It is not a cleanup completion ack.
+			name := e.store.filename(credentialID("acct-a"))
+			wait(t, func() bool {
+				if e.Ready() || !e.Gate() {
+					t.Fatal("admission reopened during failed-update containment")
+				}
+				_, err := os.Stat(filepath.Join(c.AuthDir, name))
+				return h.disabled(name) && os.IsNotExist(err)
+			})
 		})
 	}
 }
