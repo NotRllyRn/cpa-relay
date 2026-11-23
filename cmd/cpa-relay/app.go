@@ -86,38 +86,44 @@ func (s hostSource) Save(name string, raw []byte) (string, error) {
 	return out.Path, err
 }
 
-// ModelsReady joins the manager-backed runtime identity to its model registry
-// entry. A disk file, unrelated credential, or a disabled/error record is not
-// evidence of an available route. Model registration does not prove inference.
-func (s hostSource) ModelsReady(paths []string) (bool, error) {
+// CheckModels requires an exact enabled runtime/model identity for every path.
+// Raw CPA error state can outlive its cooldown: it must not veto independently
+// active accounts, or be guessed healthy from an elapsed retry timestamp.
+func (s hostSource) CheckModels(paths []string) (relay.ModelStatus, error) {
 	var models pluginapi.HostAuthModelsResponse
 	if err := s.call(pluginabi.MethodHostAuthModels, pluginapi.HostAuthModelsRequest{}, &models); err != nil {
-		return false, err
+		return relay.ModelStatus{}, err
 	}
 	var files struct {
 		Files []pluginapi.HostAuthFileEntry `json:"files"`
 	}
 	if err := s.call(pluginabi.MethodHostAuthList, struct{}{}, &files); err != nil {
-		return false, err
+		return relay.ModelStatus{}, err
 	}
+	result := relay.ModelStatus{Reason: "models_pending"}
 	if len(paths) == 0 {
-		return false, nil
+		return result, nil
 	}
+	ids, indexes := map[string]bool{}, map[string]bool{}
 	for _, path := range paths {
 		var found *pluginapi.HostAuthFileEntry
 		for i := range files.Files {
 			f := &files.Files[i]
-			if f.Path != path || f.Name != filepath.Base(path) {
+			if f.Path != path {
 				continue
 			}
 			if found != nil {
-				return false, nil
+				return relay.ModelStatus{Reason: "runtime_mismatch"}, nil
 			}
 			found = f
 		}
 		f := found
-		if f == nil || f.ID == "" || f.AuthIndex == "" || f.Provider != "codex" || f.RuntimeOnly || f.Disabled || f.Unavailable || f.Status != "active" {
-			return false, nil
+		if f == nil || f.Name != filepath.Base(path) || f.ID == "" || f.AuthIndex == "" || f.Provider != "codex" || (f.Type != "" && f.Type != "codex") || f.RuntimeOnly || ids[f.ID] || indexes[f.AuthIndex] {
+			return relay.ModelStatus{Reason: "runtime_mismatch"}, nil
+		}
+		ids[f.ID], indexes[f.AuthIndex] = true, true
+		if f.Disabled || f.Status == "disabled" {
+			return relay.ModelStatus{Reason: "runtime_disabled"}, nil
 		}
 		matched := 0
 		for _, m := range models.Credentials {
@@ -126,7 +132,7 @@ func (s hostSource) ModelsReady(paths []string) (bool, error) {
 			}
 			matched++
 			if m.ID != f.ID || m.Provider != "codex" {
-				return false, nil
+				return relay.ModelStatus{Reason: "runtime_mismatch"}, nil
 			}
 			usable := false
 			for _, id := range m.Models {
@@ -135,14 +141,27 @@ func (s hostSource) ModelsReady(paths []string) (bool, error) {
 				}
 			}
 			if !usable {
-				return false, nil
+				return relay.ModelStatus{Reason: "models_pending"}, nil
 			}
 		}
 		if matched != 1 {
-			return false, nil
+			return relay.ModelStatus{Reason: "models_pending"}, nil
+		}
+		// Neither historical successes nor retry deadlines prove current auth health.
+		// In particular a rejected access token can retain an elapsed retry deadline.
+		if f.Status == "active" && !f.Unavailable {
+			result.Available++
 		}
 	}
-	return true, nil
+	switch {
+	case result.Available == 0:
+		result.Reason = "no_available_accounts"
+	case result.Available < len(paths):
+		result.Reason = "degraded"
+	default:
+		result.Reason = "ready"
+	}
+	return result, nil
 }
 
 func success(v any) []byte {
@@ -156,6 +175,7 @@ func failure() []byte {
 }
 
 func (a *application) stop() error {
+	a.state.Store("stopping")
 	a.current.Store(nil)
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -198,7 +218,11 @@ func (a *application) configure(raw []byte, reconfigure bool) {
 		return
 	}
 	a.drained = false
-	a.state.Store("settings_invalid")
+	if a.engine != nil {
+		a.state.Store("stopping")
+	} else {
+		a.state.Store("starting")
+	}
 	a.current.Store(nil)
 	// Changed or invalid settings still withdraw before changing authority.
 	if a.engine != nil {
@@ -209,6 +233,7 @@ func (a *application) configure(raw []byte, reconfigure bool) {
 		a.engine = nil
 	}
 	if err != nil {
+		a.state.Store("settings_invalid")
 		if err == relay.ErrLegacyConfig {
 			a.state.Store("settings_migration_required")
 		}
@@ -248,7 +273,7 @@ func (a *application) handle(method string, raw []byte) []byte {
 			Resources []pluginapi.ResourceRoute   `json:"resources"`
 		}{
 			Routes:    []pluginapi.ManagementRoute{{Method: "GET", Path: "/cpa-relay/status"}, {Method: "POST", Path: "/cpa-relay/poll"}, {Method: "POST", Path: "/cpa-relay/drain"}},
-			Resources: []pluginapi.ResourceRoute{{Path: "/status", Menu: "CPA Relay", Description: "Coarse relay readiness; configure through CPA plugin settings."}, {Path: "/ready"}, {Path: "/snapshot"}},
+			Resources: []pluginapi.ResourceRoute{{Path: "/status", Menu: "CPA Relay", Description: "Read-only relay dashboard; sign in with a CPA management key."}, {Path: "/ready"}, {Path: "/snapshot"}},
 		})
 	case pluginabi.MethodRequestInterceptBefore, pluginabi.MethodRequestInterceptAfter:
 		e := a.current.Load()
@@ -264,12 +289,11 @@ func (a *application) handle(method string, raw []byte) []byte {
 }
 
 func response(status int, content string, body []byte) []byte {
-	ancestors := "'none'"
+	policy := "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
 	if content == "text/html; charset=utf-8" {
-		// CPA embeds the status resource in its same-origin management dashboard.
-		ancestors = "'self'"
+		policy = dashboardCSP
 	}
-	return success(pluginapi.ManagementResponse{StatusCode: status, Headers: http.Header{"Content-Type": {content}, "Cache-Control": {"no-store"}, "X-Content-Type-Options": {"nosniff"}, "Content-Security-Policy": {"default-src 'none'; frame-ancestors " + ancestors + "; base-uri 'none'; form-action 'none'"}, "Referrer-Policy": {"no-referrer"}}, Body: body})
+	return success(pluginapi.ManagementResponse{StatusCode: status, Headers: http.Header{"Content-Type": {content}, "Cache-Control": {"no-store"}, "X-Content-Type-Options": {"nosniff"}, "Content-Security-Policy": {policy}, "Referrer-Policy": {"no-referrer"}}, Body: body})
 }
 func jsonResponse(status int, v any) []byte {
 	b, _ := json.Marshal(v)
@@ -281,22 +305,18 @@ func (a *application) management(raw []byte) []byte {
 	if json.Unmarshal(raw, &req) != nil {
 		return jsonResponse(400, map[string]string{"error": "invalid request"})
 	}
-	// Public probes must never wait for a reconfigure/host callback lock.
-	if req.Method == "GET" && (req.Path == relay.ReadyPath || req.Path == "/v0/resource/plugins/cpa-relay/status") {
+	// The public shell never includes private state or waits for callbacks.
+	if req.Method == "GET" && req.Path == "/v0/resource/plugins/cpa-relay/status" {
+		return response(200, "text/html; charset=utf-8", dashboardHTML)
+	}
+	if req.Method == "GET" && req.Path == relay.ReadyPath {
 		e := a.current.Load()
 		ready := e != nil && !a.fault.Load() && e.Ready()
-		if req.Path == relay.ReadyPath {
-			status := 503
-			if ready {
-				status = 200
-			}
-			return jsonResponse(status, map[string]bool{"ready": ready})
-		}
-		label := "NOT READY"
+		status := 503
 		if ready {
-			label = "READY"
+			status = 200
 		}
-		return response(200, "text/html; charset=utf-8", []byte(`<!doctype html><html lang="en"><meta charset="utf-8"><title>CPA Relay</title><h1>CPA Relay</h1><p>`+label+`</p><p>Reload to update. Use CPA plugin settings for role and endpoint. Codex credentials synchronize automatically. Authenticated controls: GET /v0/management/cpa-relay/status and POST /v0/management/cpa-relay/poll and /drain. Drain successfully before disabling or unloading.</p><p>Ingress must fail closed unless /v0/resource/plugins/cpa-relay/ready returns HTTP 200. Do not expose a direct bypass.</p></html>`))
+		return jsonResponse(status, map[string]bool{"ready": ready})
 	}
 	// These paths are registered only with CPA's admin-authenticated management
 	// router. Never register drain as a public resource.
@@ -313,7 +333,15 @@ func (a *application) management(raw []byte) []byte {
 			if v := a.state.Load(); v != nil {
 				state = v.(string)
 			}
-			return jsonResponse(200, map[string]any{"ready": false, "state": state})
+			if a.fault.Load() {
+				if e != nil {
+					status := e.Status()
+					status.Ready, status.State, status.Reason, status.AvailableAccounts = false, "unready", "internal_error", 0
+					return jsonResponse(200, status)
+				}
+				state = "internal_error"
+			}
+			return jsonResponse(200, relay.Status{State: state, Reason: state, LastAttempt: state})
 		}
 		return jsonResponse(200, e.Status())
 	}
@@ -364,5 +392,5 @@ func metadata() any {
 		SchemaVersion uint32             `json:"schema_version"`
 		Metadata      pluginapi.Metadata `json:"metadata"`
 		Capabilities  map[string]bool    `json:"capabilities"`
-	}{pluginabi.SchemaVersion, pluginapi.Metadata{Name: "cpa-relay", Version: "0.2.2", Author: "NotRllyRn", GitHubRepository: "https://github.com/NotRllyRn/cpa-relay", ConfigFields: fields}, map[string]bool{"management_api": true, "request_interceptor": true, "request_interceptor_omit_body_before": true, "request_interceptor_omit_body_after": true}}
+	}{pluginabi.SchemaVersion, pluginapi.Metadata{Name: "cpa-relay", Version: "0.3.0", Author: "NotRllyRn", GitHubRepository: "https://github.com/NotRllyRn/cpa-relay", ConfigFields: fields}, map[string]bool{"management_api": true, "request_interceptor": true, "request_interceptor_omit_body_before": true, "request_interceptor_omit_body_after": true}}
 }

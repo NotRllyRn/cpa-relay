@@ -11,5 +11,6 @@ make check
 Build target: Linux amd64, baseline CPU; match the deployment libc.
 
 - [Setup, settings and required v1 migration](docs/setup.md)
+- [Dashboard usage](docs/dashboard.md)
 - [Security and limitations](docs/security.md)
 - [Checks and integration test plan](docs/testing.md)

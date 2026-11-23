@@ -64,7 +64,7 @@ func (h *mockHost) Save(name string, raw []byte) (string, error) {
 	h.mu.Unlock()
 	return path, nil
 }
-func (h *mockHost) ModelsReady(paths []string) (bool, error) {
+func (h *mockHost) CheckModels(paths []string) (ModelStatus, error) {
 	h.mu.Lock()
 	hook := h.beforeModels
 	h.mu.Unlock()
@@ -74,18 +74,18 @@ func (h *mockHost) ModelsReady(paths []string) (bool, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.modelsErr {
-		return false, ErrStorage
+		return ModelStatus{}, ErrStorage
 	}
 	if h.modelsMissing || len(paths) == 0 {
-		return false, nil
+		return ModelStatus{Reason: "models_pending"}, nil
 	}
 	for _, p := range paths {
 		a, ok := h.runtime[filepath.Base(p)]
 		if !ok || a.Disabled {
-			return false, nil
+			return ModelStatus{Reason: "models_pending"}, nil
 		}
 	}
-	return true, nil
+	return ModelStatus{Available: len(paths), Reason: "ready"}, nil
 }
 
 func (h *mockHost) disabled(name string) bool {
@@ -159,9 +159,16 @@ func TestRuntimeUpdateErrorAndConcurrentContaminationFailReadiness(t *testing.T)
 			if e.Ready() || !e.Gate() {
 				t.Fatal("unsafe runtime state ready")
 			}
-			if !h.disabled(e.store.filename(credentialID("acct-a"))) {
-				t.Fatal("failed update not synchronously disabled")
-			}
+			// Failure is now published before containment callbacks, so diagnostics
+			// remain useful if a callback blocks. It is not a cleanup completion ack.
+			name := e.store.filename(credentialID("acct-a"))
+			wait(t, func() bool {
+				if e.Ready() || !e.Gate() {
+					t.Fatal("admission reopened during failed-update containment")
+				}
+				_, err := os.Stat(filepath.Join(c.AuthDir, name))
+				return h.disabled(name) && os.IsNotExist(err)
+			})
 		})
 	}
 }

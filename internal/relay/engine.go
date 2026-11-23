@@ -33,24 +33,20 @@ type Source interface {
 }
 type Sink interface {
 	Save(name string, raw []byte) (string, error)
-	// ModelsReady confirms active runtime entries and registered models for every
-	// exact managed path, not upstream inference or quota health.
-	ModelsReady(paths []string) (bool, error)
+	// CheckModels checks every exact runtime/model identity, then counts raw
+	// active/available candidates. It does not prove upstream inference health.
+	CheckModels(paths []string) (ModelStatus, error)
+}
+
+type ModelStatus struct {
+	Available int
+	Reason    string // fixed adapter code; never a raw host error
 }
 
 type Entry struct {
 	Index, Name, Path            string
 	Codex, RuntimeOnly, Disabled bool
 	UnknownProvider              bool
-}
-
-type Status struct {
-	Role        string     `json:"role"`
-	Ready       bool       `json:"ready"`
-	State       string     `json:"state"`
-	LastAttempt string     `json:"last_attempt"`
-	Accounts    int        `json:"accounts"`
-	GeneratedAt *time.Time `json:"generated_at,omitempty"`
 }
 
 type Engine struct {
@@ -80,6 +76,16 @@ type Engine struct {
 	earliest    atomic.Int64
 	lastAttempt string
 	snapshot    *Snapshot
+	// Diagnostic fields are protected by mu and copied into immutable status.
+	modelReason           string
+	availableAccounts     int
+	modelCheckStartedAt   *time.Time
+	modelCheckCompletedAt *time.Time
+	modelCheckDurationMS  *int64
+	lastSyncAt            *time.Time
+	lastError             string
+	lastErrorAt           *time.Time
+	exported              *Status // safe metadata only; never retain exporter credentials
 }
 
 func New(c Config, secret string, source Source) (*Engine, error) {
@@ -142,7 +148,7 @@ func (e *Engine) recoverWorker() {
 		e.mu.Lock()
 		e.setReady(false)
 		e.quarantined.Store(true)
-		e.lastAttempt = "internal_error"
+		e.recordAttempt("internal_error")
 		e.publishStatus()
 		e.mu.Unlock()
 	}
@@ -177,9 +183,9 @@ func (e *Engine) initialize() bool {
 	}
 	if dirty {
 		e.quarantined.Store(true)
-		e.lastAttempt = "integrity_failed"
+		e.recordAttempt("integrity_failed")
 	} else if err != nil {
-		e.lastAttempt = "cleanup_failed"
+		e.recordAttempt("cleanup_failed")
 	}
 	return err == nil && !dirty
 }
@@ -251,6 +257,7 @@ func (e *Engine) Stop() error {
 	defer e.mu.Unlock()
 	defer e.publishStatus()
 	e.stopped = true
+	e.reconciled = false
 	e.setReady(false)
 	if e.closed {
 		return nil
@@ -259,7 +266,7 @@ func (e *Engine) Stop() error {
 		e.transport.CloseIdleConnections()
 	}
 	if e.cfg.Role == "receiver" && e.store.withdrawRuntime(e.sink) != nil {
-		e.lastAttempt = "cleanup_failed"
+		e.recordAttempt("cleanup_failed")
 		return ErrStorage
 	}
 	e.store.close()
@@ -307,90 +314,66 @@ func (e *Engine) setReady(ready bool) {
 		e.serving.Store(false)
 		return
 	}
-	deadline := e.snapshot.GeneratedAt.Add(time.Duration(e.cfg.MaxStaleSeconds) * time.Second)
-	for _, a := range e.snapshot.Accounts {
-		if a.Disabled {
-			continue
-		}
-		exp, err := a.expires()
-		if err != nil {
-			e.serving.Store(false)
-			return
-		}
-		exp = exp.Add(-time.Duration(e.cfg.ExpirySkewSeconds) * time.Second)
-		if exp.Before(deadline) {
-			deadline = exp
-		}
+	deadline, _ := snapshotDeadline(e.snapshot, e.cfg)
+	if deadline.IsZero() {
+		e.serving.Store(false)
+		return
 	}
 	e.deadline.Store(deadline.UnixNano())
 	e.earliest.Store(e.snapshot.GeneratedAt.Add(-5 * time.Second).UnixNano())
 	e.serving.Store(true)
 }
 
-// Must hold mu (except construction). Status never waits for native callbacks.
-func (e *Engine) publishStatus() {
-	s := Status{Role: e.cfg.Role, State: "starting", LastAttempt: e.lastAttempt}
-	if e.snapshot != nil {
-		t := e.snapshot.GeneratedAt
-		s.GeneratedAt = &t
-	}
-	switch {
-	case e.stopped && !e.closed:
-		s.State = "cleanup_failed"
-	case e.stopped:
-		s.State = "stopped"
-	case e.cfg.Role == "exporter":
-		s.State = "exporter"
-	case e.Ready():
-		s.State = "ready"
-		for _, a := range e.snapshot.Accounts {
-			if !a.Disabled {
-				s.Accounts++
-			}
-		}
-	case e.lastAttempt == "apply_failed":
-		s.State = "apply_failed"
-	case e.snapshot != nil:
-		s.State = "unready"
-	}
-	e.status.Store(&s)
-}
-
-func (e *Engine) Status() Status {
-	s := *e.status.Load()
-	s.Ready = e.Ready()
-	if s.State == "ready" && !s.Ready {
-		s.State = "unready"
-	}
-	return s
-}
-
 // The observation lease expires even if a native callback blocks. Native calls
 // are joined, not detached beyond the lifetime of the host context.
 func (e *Engine) checkModels() {
 	start := time.Now()
+	startedUTC := start.UTC()
+	e.modelCheckStartedAt = &startedUTC
+	if !e.serving.Load() {
+		e.modelReason = "models_pending"
+	}
+	// Publish the start before callbacks: status can explain a blocked check.
+	e.publishStatus()
 	paths := []string{}
 	for _, a := range e.snapshot.Accounts {
 		if !a.Disabled {
 			paths = append(paths, filepath.Join(e.cfg.AuthDir, e.store.filename(a.CredentialID)))
 		}
 	}
-	okay, err := e.sink.ModelsReady(paths)
+	models, err := e.sink.CheckModels(paths)
+	completed := time.Now()
+	completedUTC := completed.UTC()
+	duration := completed.Sub(start).Milliseconds()
+	e.modelCheckCompletedAt, e.modelCheckDurationMS = &completedUTC, &duration
+	e.availableAccounts = 0
+	e.modelReason = models.Reason
 	until := start.Add(3 * time.Second)
-	if err != nil || !okay || len(paths) == 0 || !time.Now().Before(until) || !e.fresh(time.Now()) {
-		e.setReady(false)
-		if err != nil {
-			e.lastAttempt = "models_failed"
-		} else {
-			e.lastAttempt = "models_pending"
+	switch {
+	case err != nil:
+		e.modelReason = "models_failed"
+		e.recordAttempt("models_failed")
+	case !completed.Before(until):
+		e.modelReason = "model_check_slow"
+		e.recordAttempt("models_pending")
+	case len(paths) == 0:
+		e.modelReason = "no_available_accounts"
+		e.recordAttempt("models_pending")
+	case !e.fresh(completed):
+		e.modelReason = "snapshot_stale"
+		e.recordAttempt("models_pending")
+	case models.Available <= 0 || models.Available > len(paths):
+		e.recordAttempt("models_pending")
+	default:
+		e.availableAccounts = models.Available
+		e.modelsUntil.Store(until.UnixNano())
+		e.setReady(true)
+		if e.lastAttempt == "models_failed" || e.lastAttempt == "models_pending" {
+			e.recordAttempt("ok")
 		}
 		return
 	}
-	e.modelsUntil.Store(until.UnixNano())
-	e.setReady(true)
-	if e.lastAttempt == "models_failed" || e.lastAttempt == "models_pending" {
-		e.lastAttempt = "ok"
-	}
+	e.setReady(false)
 }
 
 func (e *Engine) expire(now time.Time) {
@@ -406,15 +389,16 @@ func (e *Engine) expire(now time.Time) {
 			return
 		}
 		e.quarantined.Store(true)
-		e.lastAttempt = "integrity_failed"
+		e.recordAttempt("integrity_failed")
 	}
 	e.reconciled = false
 	e.setReady(false)
+	e.publishStatus() // Containment may block; expose invalidation first.
 	if e.withdrawn {
 		return
 	}
 	if e.store.withdrawRuntime(e.sink) != nil {
-		e.lastAttempt = "cleanup_failed"
+		e.recordAttempt("cleanup_failed")
 	} else {
 		e.withdrawn = true
 	}
@@ -461,41 +445,51 @@ func (e *Engine) pull(ctx context.Context) {
 		return
 	}
 	if err != nil {
-		e.lastAttempt = "fetch_failed"
+		e.recordAttempt("fetch_failed")
 		return
 	}
 	if snap.Generation <= e.store.state.Watermark {
-		e.lastAttempt = "replay_rejected"
+		e.recordAttempt("replay_rejected")
 		return
 	}
 	// Validation is all-or-nothing. Failed fetches never apply removals.
 	e.reconciled = false
 	e.setReady(false)
 	e.withdrawn = false
+	e.publishStatus()
 	if e.store.accept(snap) != nil {
-		e.lastAttempt = "apply_failed"
+		e.recordAttempt("apply_failed")
 		return
 	}
 	e.snapshot = &snap
 	if e.store.reconcile(snap, e.sink) != nil {
-		e.lastAttempt = "apply_failed"
+		e.recordAttempt("apply_failed")
+		e.publishStatus()
 		// Best effort containment of partial updates. Gate remains closed even if
 		// cleanup fails; report that failure without exposing file names or tokens.
 		if e.store.withdrawRuntime(e.sink) != nil {
-			e.lastAttempt = "cleanup_failed"
+			e.recordAttempt("cleanup_failed")
 		} else {
 			e.withdrawn = true
 		}
 		return
 	}
-	e.lastAttempt = "ok"
+	e.recordAttempt("ok")
 	e.reconciled = true
+	synced := time.Now().UTC()
+	e.lastSyncAt = &synced
 	e.checkModels()
 }
 
-func (e *Engine) Export(now time.Time) ([]byte, error) {
+func (e *Engine) Export(now time.Time) (raw []byte, err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	defer func() {
+		if err != nil {
+			e.recordAttempt("export_failed")
+		}
+		e.publishStatus()
+	}()
 	if e.stopped || e.cfg.Role != "exporter" || e.source == nil {
 		return nil, ErrExport
 	}
@@ -588,7 +582,7 @@ func (e *Engine) Export(now time.Time) ([]byte, error) {
 		}
 	}
 	sort.Slice(s.Accounts, func(i, j int) bool { return s.Accounts[i].CredentialID < s.Accounts[j].CredentialID })
-	raw, err := json.Marshal(s)
+	raw, err = json.Marshal(s)
 	if err != nil || len(raw) > MaxBody-16384 {
 		return nil, ErrExport
 	}
@@ -598,5 +592,11 @@ func (e *Engine) Export(now time.Time) ([]byte, error) {
 	if e.store.save(st) != nil {
 		return nil, ErrExport
 	}
+	generated := s.GeneratedAt.UTC()
+	deadline, reason := snapshotDeadline(&s, e.cfg)
+	e.exported = &Status{Accounts: len(s.Accounts), GeneratedAt: &generated, FreshUntil: &deadline, expiryReason: reason}
+	synced := time.Now().UTC()
+	e.lastSyncAt = &synced
+	e.recordAttempt("ok")
 	return raw, nil
 }

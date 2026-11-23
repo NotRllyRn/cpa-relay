@@ -16,8 +16,13 @@ for role in ('exporter','receiver'):
  (root/role/'plugins/cpa-relay.so').write_bytes((repo/'dist/cpa-relay.so').read_bytes())
 secret=secrets.token_urlsafe(32);admin=secrets.token_urlsafe(32);api=secrets.token_urlsafe(32)
 (root/'env').write_text('CPA_RELAY_BEARER='+secret+'\nSSL_CERT_FILE=/fixture/cert.pem\n')
-run('docker','network','create','--internal',name)
-subnet=json.loads(run('docker','network','inspect',name))[0]['IPAM']['Config'][0]['Subnet']
+subnet=os.environ.get('CPA_RELAY_TEST_SUBNET')
+if subnet:
+ subnet=str(ipaddress.IPv4Network(subnet))
+ run('docker','network','create','--internal','--subnet',subnet,name)
+else:
+ run('docker','network','create','--internal',name)
+ subnet=json.loads(run('docker','network','inspect',name))[0]['IPAM']['Config'][0]['Subnet']
 network=ipaddress.ip_network(subnet)
 # Pin fixture IPs: a restart must not reuse the stopped primary's address.
 # Docker requires an explicit subnet for static addresses; let IPAM pick it first.

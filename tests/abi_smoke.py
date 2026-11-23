@@ -88,7 +88,7 @@ def main():
         lock = threading.Lock()
         buffers, runtime, calls, callback_errors = {}, {}, [], []
         control = {"fail_disabled": 0, "disabled_attempts": 0, "models_missing": True,
-                   "source_path": str(root / "source" / "chosen.json"), "extra": False}
+                   "source_path": str(root / "source" / "chosen.json"), "extra": False, "runtime_states": {}}
         second = dict(credential, email="second@example.invalid")
         auth = root / "auth"
         auth.mkdir(mode=0o700)
@@ -107,7 +107,8 @@ def main():
                         result = {"files": [{"auth_index": "index-a", "type": "codex", "name": "chosen.json",
                                               "path": control["source_path"]}] + ([{"auth_index": "index-b", "type": "codex", "name": "second.json", "path": str(root / "source/second.json")}] if control["extra"] else []) + [
                             {"id": n, "name": n, "path": str(auth / n), "auth_index": "runtime-"+n,
-                             "provider": "codex", "status": "active", "disabled": a["disabled"]}
+                             "provider": "codex", "status": "active", "disabled": a["disabled"],
+                             **control["runtime_states"].get(n, {})}
                             for n, a in runtime.items()]}
                 elif method == "host.auth.models":
                     with lock:
@@ -259,6 +260,35 @@ def main():
                 assert any(m == "host.auth.save" and ident != main_thread for m, ident in calls)
                 assert len(runtime) == 2 and all(not a["disabled"] for a in runtime.values())
                 assert any(m == "host.auth.models" and ident != main_thread for m, ident in calls)
+
+            def relay_status():
+                return json.loads(management("/v0/management/cpa-relay/status")[1])
+
+            # Raw upstream errors must not veto an independently active account.
+            # Elapsed retries also occur on rejected tokens; never infer recovery.
+            with lock:
+                names = sorted(runtime)
+                old_error = {"status": "error", "unavailable": True,
+                             "next_retry_after": stamp(time.time_ns() - 3600 * 1_000_000_000)}
+                control["runtime_states"][names[0]] = old_error
+            until(lambda: relay_status().get("reason") == "degraded")
+            state = relay_status()
+            assert state["ready"] and state["accounts"] == state["synchronized_accounts"] == 2
+            assert state["available_accounts"] == 1
+            assert not rpc("request.intercept_before", {"Stream": True})["Terminate"]
+            with lock:
+                control["runtime_states"][names[1]] = old_error
+            until(lambda: relay_status().get("reason") == "no_available_accounts")
+            state = relay_status()
+            assert not state["ready"] and state["synchronized_accounts"] == 2 and state["available_accounts"] == 0
+            assert rpc("request.intercept_before", {"Stream": True})["Terminate"]
+            with lock:
+                control["runtime_states"] = {names[0]: {"disabled": True}}
+            until(lambda: relay_status().get("reason") == "runtime_disabled")
+            assert not ready()
+            with lock:
+                control["runtime_states"].clear()
+            until(ready)
 
             def publish(accounts):
                 generation = time.time_ns()

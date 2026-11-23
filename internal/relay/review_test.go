@@ -102,6 +102,9 @@ func TestModelLeaseExpiresAndStatusDoesNotWaitForCallback(t *testing.T) {
 	defer e.Stop()
 	wait(t, e.Ready)
 	entered, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
 	var once sync.Once
 	h.mu.Lock()
 	h.beforeModels = func() { once.Do(func() { close(entered) }); <-release }
@@ -111,19 +114,23 @@ func TestModelLeaseExpiresAndStatusDoesNotWaitForCallback(t *testing.T) {
 	done := make(chan struct{})
 	go func() { e.expire(time.Now()); close(done) }()
 	<-entered
-	statusDone := make(chan struct{})
-	go func() { _ = e.Status(); close(statusDone) }()
+	statusDone := make(chan Status, 1)
+	go func() { statusDone <- e.Status() }()
 	select {
-	case <-statusDone:
+	case status := <-statusDone:
+		if status.ModelCheckStartedAt == nil || status.ModelCheckCompletedAt == nil || !status.ModelCheckStartedAt.After(*status.ModelCheckCompletedAt) {
+			unblock()
+			t.Fatal("blocked observation start not published")
+		}
 	case <-time.After(time.Second):
-		close(release)
+		unblock()
 		t.Fatal("status waited for models callback")
 	}
 	wait(t, func() bool { return !e.Ready() })
-	if !e.Gate() {
-		t.Fatal("blocked native callback extended model observation")
+	if status := e.Status(); !e.Gate() || status.Reason != "model_check_expired" || status.AvailableAccounts != 0 {
+		t.Fatal("blocked native callback extended model observation or hid its expiry")
 	}
-	close(release)
+	unblock()
 	<-done
 }
 
