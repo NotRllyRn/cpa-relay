@@ -172,3 +172,38 @@ func TestExporterStatusKeepsOnlySafeSnapshotMetadata(t *testing.T) {
 		t.Fatalf("failed export changed successful metadata: %+v", failed)
 	}
 }
+
+func TestStatusNormalizesOffsetExpiryToUTC(t *testing.T) {
+	e, _ := statusEngine(t)
+	expiry := time.Now().Add(5 * time.Minute).In(time.FixedZone("offset", 2*3600))
+	e.mu.Lock()
+	e.snapshot.Accounts[0].Expired = expiry.Format(time.RFC3339Nano)
+	e.setReady(true)
+	e.publishStatus()
+	e.mu.Unlock()
+	got := e.Status()
+	if !got.Ready || got.FreshUntil == nil {
+		t.Fatal("fixture must remain ready")
+	}
+	want := expiry.Add(-time.Duration(e.cfg.ExpirySkewSeconds) * time.Second)
+	if !got.FreshUntil.Equal(want) {
+		t.Fatal("UTC normalization changed expiry instant")
+	}
+	if got.FreshUntil.Location() != time.UTC {
+		t.Fatalf("dashboard deadline is not UTC: %s", got.FreshUntil)
+	}
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"generated_at", "fresh_until", "model_check_started_at", "model_check_completed_at", "model_check_valid_until"} {
+		value, ok := fields[field].(string)
+		if !ok || !strings.HasSuffix(value, "Z") {
+			t.Fatalf("%s is not a UTC dashboard timestamp: %v", field, fields[field])
+		}
+	}
+}

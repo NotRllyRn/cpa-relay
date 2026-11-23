@@ -592,7 +592,7 @@ func (e *Engine) Export(now time.Time) (raw []byte, err error) {
 	if e.store.save(st) != nil {
 		return nil, ErrExport
 	}
-	generated := s.GeneratedAt
+	generated := s.GeneratedAt.UTC()
 	deadline, reason := snapshotDeadline(&s, e.cfg)
 	e.exported = &Status{Accounts: len(s.Accounts), GeneratedAt: &generated, FreshUntil: &deadline, expiryReason: reason}
 	synced := time.Now().UTC()

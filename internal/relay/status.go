@@ -41,7 +41,7 @@ func snapshotDeadline(snapshot *Snapshot, cfg Config) (time.Time, string) {
 			deadline, reason = exp, "credential_expired"
 		}
 	}
-	return deadline, reason
+	return deadline.UTC(), reason
 }
 
 // Must hold mu. Store only fixed codes, never native errors.
@@ -62,7 +62,7 @@ func (e *Engine) publishStatus() {
 		ModelCheckDurationMS: e.modelCheckDurationMS, LastSyncAt: e.lastSyncAt,
 		LastError: e.lastError, LastErrorAt: e.lastErrorAt}
 	if e.snapshot != nil {
-		generated := e.snapshot.GeneratedAt
+		generated := e.snapshot.GeneratedAt.UTC()
 		s.GeneratedAt = &generated
 		deadline, reason := snapshotDeadline(e.snapshot, e.cfg)
 		s.expiryReason = reason
